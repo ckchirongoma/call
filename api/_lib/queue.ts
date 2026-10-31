@@ -56,7 +56,10 @@
 //     C-1732): a `job` row when it is enqueued (in the trace that queued it,
 //     with meta.job_id), and when an attempt starts, finishes, fails, is held,
 //     skipped or fenced (in the job's own trace: its session's `s_<id>` when it
-//     has a session, else `job_<id>`), each with its payload.
+//     has a session, else `job_<id>`), each with its payload. A job's rows are
+//     about its own session's client and broker (read with the session, once),
+//     never the context the drain runs in, and keep the shape only when that
+//     session's consent was declined.
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
@@ -65,7 +68,7 @@ import { env } from "./env.js";
 import { capture } from "./intel.js";
 import { DeadlineError, JobFencedError, JobHoldError, MIN_CALL_MS, MODEL_REFUSAL_MS, jobCtx, type JobCtx } from "./jobctx.js";
 import type { Job } from "./types.js";
-import { cutSafe, errorText, flushTracking, since, track, trackFailure, trackingOff, withTrackContext, type TrackOptions } from "./track.js";
+import { cutSafe, errorText, flushTracking, setTrackContext, since, track, trackFailure, trackingOff, withTrackContext, type TrackContext, type TrackOptions } from "./track.js";
 
 // ── Kinds and handlers ───────────────────────────────────────────
 
@@ -242,14 +245,21 @@ export function captureJob(
   job: { id: number | string; kind: string; attempts?: number; payload?: unknown },
   more: { ok?: boolean | null; ms?: number; meta?: Record<string, unknown> } = {},
 ): void {
-  capture("job", {
-    name: `job_${event}`,
-    ok: more.ok ?? null,
-    ms: more.ms ?? null,
-    content: { payload: job.payload ?? {} },
-    // jobs.id is a bigint identity: the contract's job_id is a number (C-1713).
-    meta: { job_id: Number(job.id), kind: job.kind, attempt: job.attempts ?? 0, ...(more.meta ?? {}) },
-  });
+  // Guarded although capture() never throws: this sits on the queue's own
+  // path (before a handler runs, between a settle and its incident), where an
+  // exception would leave a job unsettled.
+  try {
+    capture("job", {
+      name: `job_${event}`,
+      ok: more.ok ?? null,
+      ms: more.ms ?? null,
+      content: { payload: job.payload ?? {} },
+      // jobs.id is a bigint identity: the contract's job_id is a number (C-1713).
+      meta: { job_id: Number(job.id), kind: job.kind, attempt: job.attempts ?? 0, ...(more.meta ?? {}) },
+    });
+  } catch {
+    // never
+  }
 }
 
 // ── Enqueueing ───────────────────────────────────────────────────
@@ -605,16 +615,27 @@ export async function fenceCheck(opts: { maxAgeMs?: number } = {}): Promise<void
   job.checkedAt = Date.now();
 }
 
-/** A job's session (its column, or a session_id in its payload) has been deleted: "forget me" landed mid-pipeline. */
-async function sessionGone(job: JobRow): Promise<boolean> {
-  if (RUNS_WITHOUT_SESSION.has(job.kind)) return false;
+/** Who a job's session is about, for its record (Chase Intelligence): its client, its broker, whether consent was declined. */
+interface SessionFacts {
+  client_id: string | null;
+  broker_id: string | null;
+  outcome: string | null;
+}
+
+/**
+ * A job's session (its column, or a session_id in its payload): `gone` when it
+ * has been deleted ("forget me" landed mid-pipeline), and the facts the job's
+ * record needs when it is there. One read, as before.
+ */
+async function sessionOf(job: JobRow): Promise<{ gone: boolean; facts: SessionFacts | null }> {
+  if (RUNS_WITHOUT_SESSION.has(job.kind)) return { gone: false, facts: null };
   const payload = job.payload && typeof job.payload === "object" ? (job.payload as Record<string, unknown>) : {};
   const sessionId = job.session_id ?? (typeof payload.session_id === "string" ? payload.session_id : null);
-  if (!sessionId) return false;
-  const { data, error } = await db().from("sessions").select("id").eq("id", sessionId).maybeSingle();
+  if (!sessionId) return { gone: false, facts: null };
+  const { data, error } = await db().from("sessions").select("id, client_id, broker_id, outcome").eq("id", sessionId).maybeSingle();
   // A read that failed is not a deleted session: the step runs, and fails on its own if the database is down.
-  if (error) return false;
-  return !data;
+  if (error) return { gone: false, facts: null };
+  return data ? { gone: false, facts: data as SessionFacts } : { gone: true, facts: null };
 }
 
 /** Why a heartbeat touched no row: the job is gone with its session, cancelled, or another worker holds it. */
@@ -938,7 +959,20 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, fresh
   const sessionRef = job.session_id ? job.session_id.slice(0, 8) : null;
   const what = `The ${job.kind.replace(/_/g, " ")} job`;
   // Every event inside the job carries its session and id (track.ts); a job's trace is its session's.
-  const context = { sessionId: job.session_id, jobId: job.id, channel: "system" as const, traceId: job.session_id ? `s_${job.session_id}` : `job_${job.id}` };
+  // Who the job is about is its own session's business, never the context the
+  // drain happens to run in (Task 0.6 review, m-8): the client, broker, turn,
+  // stage and content mode are cleared here and set from the session below.
+  const context: TrackContext = {
+    sessionId: job.session_id,
+    jobId: job.id,
+    channel: "system",
+    traceId: job.session_id ? `s_${job.session_id}` : `job_${job.id}`,
+    clientId: null,
+    brokerId: null,
+    turnId: null,
+    stage: null,
+    contentMode: undefined,
+  };
 
   await withTrackContext(context, async () => {
     const startedAt = Date.now();
@@ -999,7 +1033,12 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, fresh
     // In Postgres a job whose session_id was deleted is deleted with it; what
     // reaches here is one whose session went between claim_job and this
     // check, or one that names its session only in its payload.
-    if (await sessionGone(job)) {
+    const session = await sessionOf(job);
+    if (session.facts) {
+      // A declined-consent session's jobs keep the shape only (INTEL-PHASE0 §3).
+      setTrackContext({ clientId: session.facts.client_id, brokerId: session.facts.broker_id, ...(session.facts.outcome === "declined_consent" ? { contentMode: "meta" as const } : {}) });
+    }
+    if (session.gone) {
       const settled = await finishJob(job.id, "skipped", "the session no longer exists (forgotten or deleted)", worker);
       if (settled || (await jobGone(job.id))) {
         report.skipped++;

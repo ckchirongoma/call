@@ -19,8 +19,12 @@ import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { installFakeDb, type FakeDb } from "./_fakes.ts";
-import { SECRET_ENV, redactDeep, redactJson, redactText } from "../api/_lib/intelredact.ts";
+import { SECRET_ENV, redactContacts, redactDeep, redactJson, redactText } from "../api/_lib/intelredact.ts";
 import { __resetIntel, capture, flushIntel, traceForSession, withTrace } from "../api/_lib/intel.ts";
+
+// Built at runtime so no Supabase-key-shaped literal sits in the repo (push protection).
+const FAKE_SB_SECRET = ["sb", "secret", "TESTONLYtestonlyTESTONLYtestonly0"].join("_");
+const FAKE_SB_PUBLISHABLE = ["sb", "publishable", "TESTONLYtestonlyTESTON"].join("_");
 
 const S1 = "5e550001-0000-4000-8000-000000000001";
 const CLIENT = "00000000-0000-4000-8000-0000000000c1";
@@ -189,6 +193,54 @@ describe("intelredact: secrets", () => {
     assert.deepEqual(leaked(row), []);
     assert.equal(row!.meta.headers.authorization, "[redacted]", "meta is redacted too");
   });
+
+  // Fix round 1 (review I-1, m-7): the shapes a later task will meet that the
+  // first version let through, each from the reviewer's probe.
+  test("[C-1738] secret-named keys in camelCase, kebab-case or with a prefix or a suffix go too; error codes, counts and ids stay", () => {
+    const leak = (n: number) => `leak-value-${n}`;
+    const secretKeys = [
+      "accessToken", "sessionToken", "authToken", "refreshToken", "idToken", "webhookSecret", "appSecret", "serviceRoleKey", "privateKey",
+      "x-hub-signature-256", "X-Hub-Signature", "conversation_signature", "login_code", "signInCode", "pin_code", "verification_code",
+      "credentials", "bearer", "jwt", "pwd", "client-secret", "token_value", "secretKey", "x-api-key", "auth",
+    ];
+    const input: Record<string, unknown> = Object.fromEntries(secretKeys.map((k, i) => [k, leak(i)]));
+    const kept = { token_count: 1200, prompt_tokens: 12, code: "23505", session_id: S1, key: "data_use", signature_count: 2, pin_drop: "Soweto", authority: "FSCA" };
+    const out = redactDeep({ ...input, ...kept, nested: [{ deeper: { sessionToken: leak(99) } }] }) as Record<string, any>;
+    for (const k of secretKeys) assert.equal(out[k], "[redacted]", k);
+    for (const [k, v] of Object.entries(kept)) assert.deepEqual(out[k], v, `${k} stays`);
+    assert.equal(out.nested[0].deeper.sessionToken, "[redacted]");
+    assert.doesNotMatch(JSON.stringify(out), /leak-value/);
+    // Node's rawHeaders: a flat list, the value after the name.
+    const raw = redactDeep({ rawHeaders: ["Content-Type", "application/json", "Cookie", "call_session=abcdefghij1234567890", "authorization", "Token zzzz", "x-call-secret", "s3cr3t"] });
+    assert.deepEqual(raw.rawHeaders, ["Content-Type", "application/json", "Cookie", "[redacted]", "authorization", "[redacted]", "x-call-secret", "[redacted]"]);
+  });
+
+  test("[C-1737] signed-URL parameters with a prefix, signature headers, a bare Authorization value, short Bearer tokens and Supabase's sb_ keys are removed", () => {
+    const cases: [string, string][] = [
+      ["wss://api.elevenlabs.io/v1/convai/conversation?agent_id=agent_01abc&conversation_signature=cvtkn_01jx8f9ab2c3d4e5f6g7h8", "cvtkn_01jx8f9ab2c3d4e5f6g7h8"],
+      ["https://bucket.s3.amazonaws.com/x.pdf?X-Amz-Credential=AKIAxx%2F20261031&X-Amz-Signature=abcdef0123456789abcdef", "abcdef0123456789abcdef"],
+      ["https://bucket.s3.amazonaws.com/x.pdf?X-Amz-Credential=AKIAxx%2F20261031&X-Amz-Signature=abcdef0123456789abcdef", "AKIAxx"],
+      ["https://call.test/app?session_token=Zm9vYmFyYmF6cXV4MTIz&view=quotes", "Zm9vYmFyYmF6cXV4MTIz"],
+      ["https://call.test/auth/callback?state=x&oauth_code=4f3e2d1c0b", "4f3e2d1c0b"],
+      ["x-hub-signature-256: sha256=9f86d081884c7d659a2feaa0c55ad0159f86d081884c7d659a2feaa0c55ad015", "9f86d081884c7d659a2feaa0c55ad015"],
+      ["elevenlabs-signature: t=1761900000,v0=0f1e2d3c4b5a69788796a5b4c3d2e1f0", "0f1e2d3c4b5a69788796a5b4c3d2e1f0"],
+      ["Authorization: abc123def456ghi789jkl", "abc123def456ghi789jkl"],
+      ["Authorization: Bearer test-secret", "test-secret"],
+      ["curl -H 'Bearer shortone'", "shortone"],
+      [`key ${FAKE_SB_SECRET} here`, FAKE_SB_SECRET],
+      [`key ${FAKE_SB_PUBLISHABLE} here`, FAKE_SB_PUBLISHABLE],
+      ["https:\\/\\/call.test\\/q\\/7d9f2c1e-0000-4000-8000-00000000a001?exp=1761900000&sig=9f86", "7d9f2c1e-0000-4000-8000-00000000a001"],
+      ["session token Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo for the broker", "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo"],
+      ["Sign in: https://call.test/app/login/Q2FsbExvZ2luVG9rZW4wMTIzNDU2Nzg5", "Q2FsbExvZ2luVG9rZW4wMTIzNDU2Nzg5"],
+    ];
+    for (const [text, secret] of cases) {
+      const out = redactText(text);
+      assert.ok(!out.includes(secret), `${text} → ${out}`);
+    }
+    assert.match(redactText(cases[0]![0]), /agent_id=agent_01abc/, "a parameter that is not secret stays");
+    assert.equal(redactText("the token expires tomorrow"), "the token expires tomorrow", "a word after 'token' is not a token");
+    assert.equal(redactText("audio/webm;codecs=opus"), "audio/webm;codecs=opus", "a MIME parameter is not a link's");
+  });
 });
 
 describe("intelredact: identifiers", () => {
@@ -242,6 +294,33 @@ describe("intelredact: identifiers", () => {
     assert.doesNotMatch(written(), /482913|expires in/);
   });
 
+  // Fix round 1 (review I-3): the code is never written, however the call
+  // site describes the message and however the email lays the code out.
+  test("[C-1741] a sign-in code is never written: kind in content or meta or the name, the code on its own line or in its own tag, under a key", async () => {
+    const html = '<p>Your sign-in code is</p><p style="font-size:32px;font-weight:700;color:#171f1a">482913</p>';
+    const out = await captured(() => {
+      capture("say", { name: "email:sign_in", content: { text: "Your Call sign-in code:\n\n482913\n\nIt expires in 10 minutes.", kind: "login_code" }, meta: { chars: 50 } });
+      capture("send", { name: "email:login_code", content: { subject: "Your Call sign-in code", html, text: "Your Call sign-in code:\n\n482913" }, meta: { type: "email" } });
+      capture("track", { name: "login_requested", content: { props: { login_code: "482913", signInCode: 482913, code: "482913", error: { code: "23505" }, meta_error: { code: 131047 } } } });
+    });
+    // A bare `code` holding six digits as text is the sign-in code's shape; an error code is not (SQLSTATE is five characters, Meta's are numbers).
+    assert.equal(out[2]!.content.props.code, "[redacted]");
+    assert.equal(out[2]!.content.props.error.code, "23505");
+    assert.equal(out[2]!.content.props.meta_error.code, 131047);
+    assert.equal(out.length, 3);
+    assert.equal(out[0]!.content, null, "kind in content");
+    assert.equal(out[0]!.meta.kind, "login_code");
+    assert.equal(out[1]!.content, null, "the name says it");
+    assert.equal(out[1]!.meta.kind, "login_code");
+    assert.doesNotMatch(written(), /482913/);
+    // And the text rules alone, whatever carries the text.
+    for (const text of ["Your Call sign-in code:\n\n482913\n\nIt expires", html, "Use code\n  4 8 2 9 1 3", "Your verification code is <b>482913</b>."]) {
+      assert.doesNotMatch(redactText(text), /482913|4 8 2 9 1 3/, text);
+    }
+    assert.doesNotMatch(redactText("4471 is my pin"), /4471/);
+    assert.doesNotMatch(redactText("PIN: 4 4 7 1"), /4 4 7 1/);
+  });
+
   test("[C-1742] 'my PIN is 4471' and 'the OTP is 552019' lose their digits", async () => {
     for (const [text, digits] of [
       ["my PIN is 4471", "4471"],
@@ -271,6 +350,44 @@ describe("intelredact: identifiers", () => {
     assert.equal(fromTurn!.content.text, stored);
     assert.doesNotMatch(written(), /example\.test|993 000/);
   });
+
+  // Fix round 1 (review I-2, m-1): the written forms of the same numbers.
+  test("[C-1739] phone, ID and card numbers written with brackets, dots, double spaces, a word glued on, or read out digit by digit go too", () => {
+    const cases = [
+      "phone (082) 123 4567 please",
+      "phone 082.123.4567 please",
+      "phone +27 (0)82 123 4567 please",
+      "ID no.8001015009087 please",
+      "client x8001015009087 please",
+      "id_8001015009087 please",
+      "card 4111 1111  1111 1111 please",
+      "card 4111 - 1111 - 1111 - 1111 please",
+      "it's 0, 8, 2, 1, 2, 3, 4, 5, 6, 7 please",
+      "it's 8 0 0 1 0 1 5 0 0 9 0 8 7 please",
+      "it's zero eight two one two three four five six seven please",
+      "ID 0101 015 009 087 please",
+    ];
+    for (const c of cases) {
+      const out = redactText(c);
+      assert.doesNotMatch(out, /\d[\d\s().,-]*\d/, `${c} → ${out}`);
+      assert.match(out, /\[(number|contact)\] please$/, `${c} → ${out}`);
+      assert.doesNotMatch(out, /zero|eight|seven/, `${c} → ${out}`);
+    }
+    assert.equal(redactText("phone (082) 123 4567 please"), "phone [contact] please", "a phone number is contact data");
+    // The same rule as the turn's own redaction (SPEC 7.2) will use: one implementation, so the two agree exactly (C-1743).
+    assert.equal(redactContacts("WhatsApp me on (082) 123 4567 or thandi@example.test"), "WhatsApp me on [contact] or [contact]");
+    assert.equal(redactContacts("ID 8001015009087"), "ID 8001015009087", "redactContacts is contact data only");
+  });
+
+  test("[C-1740] dates and times stay whole, and so does money written with decimals or as a list of amounts", () => {
+    for (const text of [
+      "called at 2026-10-31 14:30 today",
+      "on 31/10/2026 14:30, and 2026-10-31T08:00:00.000Z",
+      "premium R1 500,50 or R1 500 000.00 a year",
+      "options R1 500 000, R2 000 000 and R3 000 000",
+      "between 31.10.2026 and 30.11.2026",
+    ]) assert.equal(redactText(text), text);
+  });
 });
 
 describe("intelredact: bytes", () => {
@@ -296,5 +413,17 @@ describe("intelredact: bytes", () => {
     assert.deepEqual(out[2]!.content.args.file, { type: "audio/webm", size: 6000 });
     assert.deepEqual(out[2]!.content.args.blob, { type: "audio/ogg", size: 6000 });
     assert.match(out[3]!.content.text, /^the PDF said \[bytes\] and then nothing$/);
+  });
+  // Fix round 1 (review m-2): base64url and wrapped base64 are bytes too; a long word without spaces is not.
+  test("[C-1734] base64url and line-wrapped base64 are bytes; a long string of one letter is not mistaken for a file", async () => {
+    const bytes = new Uint8Array(3000).map((_, i) => (i * 37 + 11) % 256);
+    const url = Buffer.from(bytes).toString("base64url");
+    const wrapped = Buffer.from(bytes).toString("base64").match(/.{1,76}/g)!.join("\n");
+    assert.doesNotMatch(redactText(`audio ${url} end`), /[A-Za-z0-9_-]{60,}/);
+    assert.doesNotMatch(redactText(`--boundary\nContent-Transfer-Encoding: base64\n\n${wrapped}\n--boundary--`), /[A-Za-z0-9+/]{60,}/);
+    const out = await captured(() => capture("tool", { name: "upload", content: { args: { file: url, wrapped, note: "x".repeat(20_000) } } }));
+    assert.deepEqual(out[0]!.content.args.file, { type: "base64", size: 3000 });
+    assert.equal(out[0]!.content.args.wrapped.type, "base64");
+    assert.equal(typeof out[0]!.content.args.note, "string", "twenty thousand x's are not a file");
   });
 });

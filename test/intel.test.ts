@@ -166,6 +166,51 @@ describe("intel: capture is additive", () => {
     assert.equal(intel.intelStats().buffered, 1);
   });
 
+  // Fix round 1 (review m-3): the label for the one warning is read inside its own guard.
+  test("[C-1700] capture never throws, even on the first failure in a process, with a name that throws, no options, or meta that cannot be read", (t) => {
+    t.mock.method(console, "warn", () => {});
+    intel.__resetIntel();
+    assert.doesNotThrow(() => intel.capture("track", { get name(): string { throw new Error("name getter"); } } as never));
+    assert.doesNotThrow(() => (intel.capture as (k: string, o?: unknown) => void)("track", undefined));
+    assert.doesNotThrow(() => intel.capture("track", { name: { toString() { throw new Error("toString"); } } as never }));
+    assert.doesNotThrow(() => intel.capture("track", { name: "proxy", meta: new Proxy({}, { ownKeys() { throw new Error("ownKeys"); } }) }));
+    assert.doesNotThrow(() => intel.capture("track", { name: "kind getter", content: { get kind() { throw new Error("kind"); } } }));
+  });
+
+  // Fix round 1 (review I-4): big structured content is a reference at capture;
+  // its serialising, cutting and redacting all happen in the flush.
+  test("[C-1701] capture stays under 5 ms at p95 for big structured content: an 8,000-row catalogue, 12,000 transcript segments, a 5 MB payload; the cut and the redaction wait for the flush", async () => {
+    const catalogue = { args: { rows: Array.from({ length: 8_000 }, (_, i) => ({ category: "funeral", provider: "Demo Life", product: `Plan ${i}`, cover_cents: 1_000_000 + i, premium_cents: 8_500 + i, notes: "a" })) } };
+    const segments = { audio: { type: "audio/webm", size: 1 }, response: "x", segments: Array.from({ length: 12_000 }, (_, i) => ({ start: i * 3.1, end: i * 3.1 + 3, text: `segment ${i}: the client said something about cover` })) };
+    const payload = { list: Array.from({ length: 200_000 }, (_, i) => `item ${i} words`), sessionToken: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo" };
+    for (const [name, content] of [["catalogue_upload", catalogue], ["model_call:voice", segments], ["five_mb", payload]] as const) {
+      const times: number[] = [];
+      for (let i = 0; i < 40; i++) {
+        const started = performance.now();
+        intel.capture("tool", { name, content });
+        times.push(performance.now() - started);
+      }
+      times.sort((a, b) => a - b);
+      const p95 = times[Math.floor(times.length * 0.95)]!;
+      assert.ok(p95 < 5, `${name}: p95 ${p95.toFixed(2)} ms`);
+    }
+    intel.__resetIntel();
+    // One of each, written after: cut to the limit by its longest lists, redacted, with what was cut said.
+    intel.capture("tool", { name: "catalogue_upload", content: catalogue });
+    intel.capture("tool", { name: "model_call:voice", content: segments });
+    intel.capture("tool", { name: "five_mb", content: payload });
+    assert.deepEqual(await intel.flushIntel(), { written: 3, dropped: 0 });
+    for (const r of rows()) {
+      const kept = Buffer.byteLength(JSON.stringify(r.content));
+      assert.ok(kept <= 1_000_000 && kept > 800_000, `${r.name}: ${kept} bytes`);
+      assert.ok(r.meta.truncated_bytes > 0, r.name);
+    }
+    assert.doesNotMatch(JSON.stringify(rows()), /Zm9vYmFyYmF6cXV4MTIz/, "redacted in the flush");
+    const cat = named("catalogue_upload")[0]!.content.args.rows;
+    assert.deepEqual(cat[0], { category: "funeral", provider: "Demo Life", product: "Plan 0", cover_cents: 1_000_000, premium_cents: 8_500, notes: "a" }, "the shape and the money survive the cut");
+    assert.match(String(cat[cat.length - 1]), /more items cut/);
+  });
+
   test("[C-1703] a handler's rows are written in one batch after the response is sent, through the flush handed to waitUntil, never before", async () => {
     const REQ_CONTEXT = Symbol.for("@vercel/request-context");
     const waited: Promise<unknown>[] = [];
@@ -387,7 +432,8 @@ describe("intel: one id per task", () => {
     for (const r of rows().filter((r) => r.kind === "job" && r.meta.job_id === forgetId && r.name !== "job_enqueued")) assert.equal(r.trace_id, `job_${forgetId}`, r.name);
   });
 
-  test("[C-1714] a transcript turn's id is t_ + 16 hex of sha256(session:idx); a WhatsApp inbound's of the wamid; no turn_id ever holds a phone number", async () => {
+  test("[C-1714] a transcript turn's id is t_ + 16 hex of sha256(session:idx); a WhatsApp inbound's of the wamid; no turn_id ever holds a phone number", async (t) => {
+    t.mock.method(console, "warn", () => {});
     const sha16 = (s: string) => createHash("sha256").update(s).digest("hex").slice(0, 16);
     assert.equal(intel.turnIdFor(S1, 3), `t_${sha16(`${S1}:3`)}`);
     const wamid = "wamid.HBgLMjc3OTk5MzAwMDEVAgASGBQzQTdEQjQ3QTk2RjM0M0E1RDY0RgA=";
@@ -395,12 +441,15 @@ describe("intel: one id per task", () => {
     await intel.withTrace({ traceId: intel.traceForSession(S1), sessionId: S1 }, async () => {
       intel.capture("ask", { name: "turn", turnId: intel.turnIdFor(S1, 3), content: { text: "Yes", kind: "turn", t: 9.1 } });
       intel.capture("ask", { name: "whatsapp_in", channel: "whatsapp", turnId: intel.turnIdForWamid(wamid), content: { text: "Thanks", kind: "text" } });
-      // A caller that passes a raw id (a number, a wamid) by mistake still gets a hash.
+      // A caller that passes a raw id (a number, a wamid) by mistake gets no
+      // turn id at all: an unsalted hash of a phone number is the number, to
+      // anyone with a minute to try them all (review m-6).
       intel.capture("ask", { name: "raw_turn", turnId: "27799930001", content: { text: "Hi", kind: "text" } });
     });
     await intel.flushIntel();
-    assert.deepEqual(rows().map((r) => r.turn_id), [intel.turnIdFor(S1, 3), intel.turnIdForWamid(wamid), `t_${sha16("27799930001")}`]);
-    for (const r of rows()) {
+    assert.deepEqual(rows().map((r) => r.turn_id), [intel.turnIdFor(S1, 3), intel.turnIdForWamid(wamid), null]);
+    assert.ok(!JSON.stringify(rows()).includes(sha16("27799930001")), "not its hash either");
+    for (const r of rows().filter((r) => r.turn_id !== null)) {
       assert.match(r.turn_id, /^t_[0-9a-f]{16}$/);
       assert.doesNotMatch(r.turn_id, /2779993/);
     }
@@ -420,6 +469,43 @@ describe("intel: one id per task", () => {
     assert.equal(broker!.business_id, null);
     assert.equal(broker!.meta.broker_id, BROKER);
     assert.equal(broker!.actor, "person");
+  });
+
+  // Fix round 1 (review m-8): a drain run inside someone's context must not
+  // lend its client to the jobs; each job's client is its own session's.
+  test("[C-1715] a job's rows carry its own session's client and broker, never the outer context's; a declined-consent session's jobs keep the shape only", async () => {
+    const OUTER_BROKER = "00000000-0000-4000-8000-0000000000b9";
+    await db().from("sessions").update({ client_id: OTHER_CLIENT, outcome: "declined_consent" }).eq("id", S2);
+    queue.registerHandler("extract_facts", async () => intel.capture("tool", { name: "inside", content: { text: "the client's words" } }));
+    const one = Number(await queue.enqueue("extract_facts", S1, { session_id: S1 }));
+    const two = Number(await queue.enqueue("extract_facts", S2, { session_id: S2 }));
+    await intel.withTrace(
+      { traceId: intel.requestTraceId(), clientId: "00000000-0000-4000-8000-0000000000c9", brokerId: OUTER_BROKER, stage: "outer", turnId: intel.turnIdFor(S3, 1), contentMode: "meta" },
+      () => queue.drain({ maxJobs: 2, noHandOn: true }),
+    );
+    await flushTracking();
+    const inside = (job: number) => rows().find((r) => r.name === "inside" && r.job_id === job)!;
+    assert.equal(inside(one).business_id, CLIENT);
+    assert.equal(inside(one).meta.broker_id, BROKER);
+    assert.equal(inside(one).stage, null);
+    assert.equal(inside(one).turn_id, null);
+    assert.deepEqual(inside(one).content, { text: "the client's words" }, "not the outer context's meta mode");
+    assert.equal(inside(two).business_id, OTHER_CLIENT);
+    assert.equal(inside(two).content, null, "a declined-consent session's job keeps the shape only");
+    assert.equal(inside(two).content_mode, "meta");
+    assert.ok(!rows().some((r) => r.business_id === "00000000-0000-4000-8000-0000000000c9" || r.meta?.broker_id === OUTER_BROKER));
+  });
+
+  // Fix round 1 (review m-5): indexed columns take ids, not words.
+  test("a bad call site cannot put free text in the trace, stage or name columns", async () => {
+    await intel.withTrace({ traceId: "free text with 0799930001 in it", sessionId: "not a uuid 0799930001", stage: "readback for thandi@example.test" }, async () =>
+      intel.capture("track", { name: "named for 0799930001" }),
+    );
+    await intel.flushIntel();
+    const [row] = rows();
+    assert.match(row!.trace_id, /^p_[0-9a-f]{16}$/, "an id that is not an id is not used");
+    assert.equal(row!.stage, "readback for [contact]");
+    assert.equal(row!.name, "named for [contact]");
   });
 
   test("[C-1716] every row's channel is one of phone, web, meeting, dashboard, email, whatsapp, system", async () => {
@@ -758,6 +844,56 @@ describe("intel: forgetting wins, and a task reads back whole", () => {
     assert.doesNotMatch(JSON.stringify(rows()), /I am 42|buffered words/);
   });
 
+  // Fix round 1 (review I-5): the reviewer's probe, a delivery webhook in the
+  // same process flushing while the forget reads the client's traces.
+  test("[C-1745] a flush that runs while forgetIntel is reading the client's traces never lands after the deletes", async () => {
+    await intel.withTrace({ traceId: intel.traceForSession(S1), sessionId: S1, clientId: CLIENT }, async () => intel.capture("ask", { name: "turn", content: { text: "I am 42", kind: "turn", t: 1 } }));
+    await intel.flushIntel();
+    const forgetting = intel.forgetIntel(CLIENT);
+    await intel.withTrace({ traceId: intel.traceForSession(S1), sessionId: S1 }, async () => intel.capture("track", { name: "delivery:delivered", content: { props: { to_words: "Thandi's quote" } } }));
+    const flushing = intel.flushIntel();
+    await forgetting;
+    await flushing;
+    // And a flush already past its batching when the forget starts.
+    await intel.withTrace({ traceId: intel.traceForSession(S2), sessionId: S2, clientId: OTHER_CLIENT }, async () => intel.capture("ask", { name: "other", content: { text: "x", kind: "turn", t: 1 } }));
+    await intel.withTrace({ traceId: intel.traceForSession(S2), sessionId: S2 }, async () => intel.capture("track", { name: "s2_late" }));
+    const early = intel.flushIntel();
+    const second = intel.forgetIntel(OTHER_CLIENT);
+    await early;
+    await second;
+    await intel.flushIntel();
+    assert.deepEqual(rows().map((r) => `${r.trace_id}:${r.name}`), []);
+  });
+
+  // Fix round 1 (review I-6): a job queued from the client's task with no
+  // session runs in its own job_<id> trace, with no client on its rows.
+  test("[C-1745] forgetting follows the jobs the client's task queued, as readTrace does: a session-less job's rows go too, and an unrelated job's stay", async () => {
+    queue.registerHandler("notify_broker", async (job) => {
+      const payload = job.payload as { client_name?: string };
+      intel.capture("say", { name: "email:broker_new_quote", content: { text: `${payload.client_name} (42) wants funeral cover for four people`, kind: "email" } });
+    });
+    await intel.withTrace({ traceId: intel.traceForSession(S1), sessionId: S1, clientId: CLIENT }, async () => {
+      intel.capture("ask", { name: "turn", content: { text: "I am 42", kind: "turn", t: 1 } });
+      await queue.enqueue("notify_broker", null, { client_name: "Thandi" });
+    });
+    await intel.withTrace({ traceId: intel.requestTraceId(), brokerId: BROKER }, async () => queue.enqueue("notify_broker", null, { client_name: "Sipho" }));
+    await queue.drain({ maxJobs: 3, noHandOn: true });
+    await flushTracking();
+    const before = await intel.readTrace(`s_${S1}`);
+    assert.ok(before.some((r) => r.name === "email:broker_new_quote" && r.trace_id.startsWith("job_")), "readTrace folds the job in");
+    const others = rows().filter((r) => !before.some((b) => b.id === r.id));
+    assert.ok(others.some((r) => /Sipho/.test(JSON.stringify(r.content))), "the unrelated job ran too");
+
+    const removed = await intel.forgetIntel(CLIENT);
+    assert.equal(removed, before.length, "every row readTrace would show");
+    assert.doesNotMatch(JSON.stringify(rows()), /Thandi/);
+    assert.deepEqual(rows().map((r) => r.id).sort(), others.map((r) => r.id).sort(), "nothing else");
+    // A late row of the forgotten job (a retry, a delivery) is not even buffered.
+    const jobTrace = before.find((r) => r.trace_id.startsWith("job_"))!.trace_id;
+    await withTrackContext({ jobId: Number(jobTrace.slice(4)), traceId: jobTrace }, async () => intel.capture("track", { name: "late_in_job" }));
+    assert.equal(intel.intelStats().buffered, 0);
+  });
+
   test("[C-1746] forgetting twice: the second deletes nothing and succeeds, and so does forgetting before the table exists", async () => {
     await intel.withTrace({ traceId: intel.traceForSession(S1), sessionId: S1, clientId: CLIENT }, async () => intel.capture("ask", { name: "turn", content: { text: "x", kind: "turn", t: 1 } }));
     await intel.flushIntel();
@@ -805,6 +941,20 @@ describe("intel: forgetting wins, and a task reads back whole", () => {
     const forget = await intel.readTrace(String(jobs.forget));
     assert.ok(forget.length > 0 && forget.every((r) => r.trace_id === `job_${jobs.forget}`));
     assert.deepEqual(await intel.readTrace("no_such_trace"), []);
+  });
+
+  // Fix round 1 (review m-11): a trace that is cut says so.
+  test("[C-1754] readTrace that stops following queued jobs says so, once, rather than returning part of a task in silence", async (t) => {
+    const warn = t.mock.method(console, "warn", () => {});
+    await intel.withTrace({ traceId: intel.traceForSession(S1), sessionId: S1 }, async () => {
+      for (let i = 1; i <= 60; i++) intel.capture("job", { name: "job_enqueued", meta: { job_id: 1000 + i, kind: "notify_broker", attempt: 0 } });
+    });
+    await intel.flushIntel();
+    const trace = await intel.readTrace(`s_${S1}`);
+    assert.equal(trace.length, 60);
+    const lines = warn.mock.calls.map((c) => String(c.arguments[0]));
+    assert.equal(lines.filter((l) => /readTrace/.test(l)).length, 1);
+    assert.match(lines.find((l) => /readTrace/.test(l))!, /cut|stopped/);
   });
 
   test("[C-1753] docs/INTEL-CONTRACT.md is Charlie's file, unchanged", () => {

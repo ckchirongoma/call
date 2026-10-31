@@ -417,14 +417,16 @@ export interface CallOptions {
  */
 export async function callOpenRouter(model: string, messages: { role: string; content: unknown }[], opts: CallOptions): Promise<CallResult> {
   const started = Date.now();
+  let r: CallResult;
   try {
-    const r = await callOnce(model, messages, opts);
-    captureCall(model, messages, opts, started, r, undefined);
-    return r;
+    r = await callOnce(model, messages, opts);
   } catch (err) {
     captureCall(model, messages, opts, started, null, err);
     throw err;
   }
+  // After the try, not inside it: nothing in the record may turn a good answer into a failed call.
+  captureCall(model, messages, opts, started, r, undefined);
+  return r;
 }
 
 /** The `model` row for one attempt (INTEL-CONTRACT §3): the words in content, the facts in meta. */
