@@ -1,0 +1,571 @@
+# Call — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task (BEHAVIOR-MATRIX A1 requires execution agents here). Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** A phone number and a browser button that run a fact-find with a client, read it back, and within minutes hand the broker a matched, drafted quotation to approve and send by email or WhatsApp — plus the same pipeline on a recorded in-person meeting — with every call recorded, every fact sourced, every figure from the catalogue, and every cost on a ledger.
+
+**Architecture:** ElevenLabs Agents does the talking and calls our Vercel functions before (init), during (server tools) and after (post-call webhooks) the call. Everything after the webhook is a job queue in Supabase worked by `/api/worker`: ingest → facts (sourced, refusal rules) → needs (rules first) → match (one product per need, price from pricing bands in code) → write (model repeats numbers, never produces them) → check (rules, then Jev or a small model) → notify. The broker approves in a server-rendered dashboard; delivery is Resend or Meta. No framework, no build step; TypeScript run natively by Node ≥ 22.6, exactly as Charlie.
+
+**Tech Stack:** Node ≥ 22.6 (native type stripping), TypeScript 5, Vercel functions, `@supabase/supabase-js`, `puppeteer-core` + `@sparticuz/chromium` (PDF only), ElevenLabs Agents (REST for config push; webhooks in), OpenRouter (chat + audio endpoints), Resend, Meta WhatsApp Cloud API, optional Jev (TypeSafe). No other dependencies.
+
+**Spec:** `docs/SPEC.md` (design), `docs/AGENT-PROMPT.md` (agent), `BEHAVIOR-MATRIX.md` Part B (state × event), `criteria/*.md` (1,264 acceptance criteria), `docs/RESEARCH.md` (why). Executors read SPEC §0 and the task's criteria rows before starting.
+
+**Reference implementation to port from:** `../charlie` (checked out beside this repo). Files named "port" below are copied, attributed in the header comment ("Ported from Charlie `api/_lib/x.ts`; the why-comments are kept"), then trimmed to what this repo uses.
+
+## Global Constraints
+
+- Node `>=22.6`; `"type": "module"`; every relative import in `api/` ends in `.js` (CI greps). Tests import `.ts` directly.
+- No framework, no bundler, no build step. `npm run typecheck`, `npm test`, `npm run verify`.
+- Dependencies: exactly the four in `package.json` plus dev `typescript`, `@types/node`. Adding one is a plan change.
+- No model slug anywhere in `api/` except `HARD_FALLBACKS` in `api/_lib/models.ts` (SPEC R10). Roles: `extract`, `needs`, `writer`, `checker`, `safety`, `voice`, `summary`.
+- Documents (`quotedoc.ts`, `roa.ts`, `docparts.ts`): `<table role="presentation">`, inline hex, no grid/flex/`var()`/external CSS (SPEC R8). Brand hex: charcoal `#171f1a`, green `#1f7a4d`, light `#f4f6f5`, rule `#d9e0dc`, text `#222`.
+- Every test name carries its criteria ids: `test("[C-0412][C-0413] …")`. A task is not done until `npm run criteria -- --check` shows its ids tagged.
+- Test numbers only in the range `+2779993xxxx`; emails `*@example.test`; providers "Demo …" (BEHAVIOR-MATRIX A11/A12).
+- Every webhook verifies HMAC over raw bytes with `timingSafeEqual` before parsing; events are stored, then processed in a job.
+- Every table: RLS on; only `products`, `product_categories`, `disclosures` have a `SELECT` policy for `anon, authenticated`. Every table has `created_at timestamptz not null default now()`.
+- Every model call: through `askJSON()` in `models.ts` with retries, fallbacks, truncation handling, `max_tokens ≥ 1200`.
+- Money is integer cents in the database; `formatRand(cents)` renders "R 1 235" (space thousands, whole rand).
+- Dates in documents: "31 October 2026"; times in the dashboard: SAST (`Africa/Johannesburg`).
+- Commit after every task with a message in the imperative, ending with the session's attribution lines; never a model identifier in the commit.
+
+## Review Focus
+
+Inputs the spec implies but no single task's happy path exercises; each line's test is added to the owning task below.
+
+1. **A caller who gives money as "ten" in an income context and "ten" again as a count of years.** `figures.ts` must scale only when the prior agent turn asked a money question (Task 2.1 test `[C-0525][C-0526]`).
+2. **ElevenLabs delivers the audio event, then the transcript event for a conversation whose init never fired (widget preview).** Session must be created on the audio event and merged on the transcript, no duplicate (Task 3.5 test `[C-0427][C-0430]`).
+3. **A read-back correction after the channel question** ("oh and actually I'm 43" after the email was confirmed). The correction still supersedes; the channel stays (Task 2.3 test `[C-0600]`).
+4. **A broker edits a fact after the quote was sent.** A new version must exist, labelled not sent, and the sent version untouched (Task 8.3 test `[C-1162]`).
+5. **Resend's daily cap is hit mid-batch during a demo.** `send_quote` must queue to the next UTC day with status `approved`, not `failed`, and the dashboard must say so (Task 7.3 test `[C-1067][C-1068][C-1070]`).
+
+---
+
+## How the orchestrator runs this plan (BEHAVIOR-MATRIX A1–A3)
+
+1. Read `CLAUDE.md`, `BEHAVIOR-MATRIX.md`, `docs/SPEC.md`, this plan. Run `npm install && npm run criteria -- --count --matrix`.
+2. For each task, in order within a phase (phases may interleave only where the task says "parallel-safe"): dispatch a **fresh execution agent** with the brief template below; when it returns, dispatch a **fresh reviewer agent** with the review template; apply the reviewer's required changes via the same executor (SendMessage) or a new one; then run `npm run typecheck && npm test` yourself.
+3. At the end of each phase: `npm run verify`; `npm run criteria -- --missing | head -60` to see what the phase left; a **phase reviewer** agent reads the whole phase diff against SPEC §0 and Part B; fix; commit; push.
+4. An executor spawns no agents. An executor that needs a decision the plan does not make stops and reports; the orchestrator decides and records the decision in the task's notes in this file.
+5. Never mark a criterion tagged without a test that would fail on the old code. The reviewer checks the red step's output is in the executor's report.
+
+**Executor brief template** (fill the brackets; paste the task verbatim):
+
+> You are implementing Task N of `docs/superpowers/plans/2026-10-31-call-build.md` in `/home/user/call`. Read `CLAUDE.md`, `docs/SPEC.md` §[sections], `BEHAVIOR-MATRIX.md` Part B §[B-sections], and the criteria rows [ids] in `criteria/[file]`. Charlie's reference file is `../charlie/api/_lib/[x].ts`. Follow the task's steps exactly: write the failing test first and paste its failing output in your report, then implement, then paste the passing output, then commit with the given message plus the attribution lines in the system reminder. Do not touch files outside the task's list. Do not add dependencies. Do not spawn agents. Report: files changed, test output (red and green), criteria ids tagged, anything the plan left undecided.
+
+**Reviewer template:**
+
+> Review the diff for Task N (`git diff HEAD~1`) against the task text in the plan and criteria rows [ids]. Check: (1) the red step genuinely failed for the right reason; (2) every listed criterion has a tag in a test that asserts the row's then-clause, not a weaker one; (3) SPEC §0 rules R1–R15 are not violated; (4) no model slug, no grid/flex/var() in documents, no secrets, no real numbers; (5) names and signatures match the task's Interfaces block. Reply with "APPROVE" or a numbered list of required changes with file:line.
+
+---
+
+## Phase 0 — Scaffold, fakes, and the ported foundations
+
+### Task 0.1: Environment, database client, and the in-memory fakes
+
+**Files:**
+- Create: `api/_lib/env.ts`, `api/_lib/db.ts`, `api/_lib/types.ts`, `test/_fakes.ts`, `test/_env.ts`, `test/fakes.test.ts`
+- Port from: `../charlie/api/_lib/env.ts`, `../charlie/api/_lib/db.ts` (client creation only), `../charlie/test/_fakes.ts`
+
+**Interfaces:**
+- Produces: `env` (frozen snapshot of every variable in `.env.example`, with defaults as listed there); `db(): SupabaseClient` (service role); `installFakeDb(seed?)` returning `FakeDb { client, tables, log, reset() }` with tables for every table in SPEC §4; `installFakeNet()` returning `FakeNet { onModel(re, fn), onFetch(urlRe, fn), calls }` intercepting `fetch`; `fakeStorage()` with `upload/download/remove/list` and `files: Map<string, Uint8Array>`; `fakeClock(iso)` controlling `Date.now()`; `test/_env.ts` setting the fake env before any import (as Charlie's e2e tests do).
+- Fake DB supports: `from().select().eq/is/in/gte/lt/order/limit/single/maybeSingle`, `insert`, `upsert` (with `onConflict`), `update().eq`, `delete().eq/in`, `rpc("claim_job")`, `storage.from(bucket)`; anything else throws `FakeDbUnsupported` naming the shape.
+
+- [ ] **Step 1: Write the failing test** `test/fakes.test.ts`: `[C-1580]`-adjacent smoke — insert a `brokers` row, select it back, `upsert` with `onConflict: "broker_id,phone_e164"` twice yields one `clients` row; an unsupported shape (`.textSearch`) throws `FakeDbUnsupported`.
+- [ ] **Step 2: Run** `npm test -- test/fakes.test.ts` → FAIL (module not found).
+- [ ] **Step 3: Implement** `env.ts` (snapshot at import; `required(name)` helper), `db.ts` `db()`, `types.ts` (row types for SPEC §4 tables as TypeScript interfaces), `_fakes.ts` (port; add Storage and clock).
+- [ ] **Step 4: Run** → PASS. `npm run typecheck` → clean.
+- [ ] **Step 5: Commit** `Scaffold: env snapshot, db client, in-memory fakes`
+
+### Task 0.2: Webhook signature verifiers
+
+**Files:** Create `api/_lib/crypto.ts`, `test/crypto.test.ts`. Port the HMAC helpers from `../charlie/api/_lib/crypto.ts`.
+
+**Interfaces:**
+- `verifyElevenLabs(raw: Buffer, header: string | null, secrets: string[], nowSecs?: number): { ok: boolean; reason?: "missing"|"malformed"|"stale"|"future"|"mismatch"; secretIndex?: number }` — header `t=<unix>,v0=<hex>[,v0=<hex>]`, HMAC-SHA256 hex over `${t}.${raw}`, reject `t` older than 1800 s or more than 300 s ahead.
+- `verifyResend(raw: Buffer, headers: {id, timestamp, signature}, secretB64: string): boolean` — svix scheme, 300 s tolerance.
+- `verifyMeta(raw: Buffer, header: string | null, appSecret: string): boolean` — `sha256=<hex>`.
+- `safeEqualHex(a: string, b: string): boolean` — length check then `timingSafeEqual`.
+- `hmacHex(secret, data)`, `sha256Hex(data)`.
+
+- [ ] **Step 1: Write failing tests** tagged `[C-0412][C-0414][C-0415][C-0416][C-0417][C-0418][C-0419][C-0421][C-0422][C-1587][C-1588][C-1589][C-1590][C-1591]`: build a signed body with a known secret; assert each reason; multibyte body; two `v0=` values; two secrets (rotation) returns `secretIndex: 1`.
+- [ ] **Step 2: Run** → FAIL. **Step 3: Implement.** **Step 4: Run** → PASS.
+- [ ] **Step 5: Commit** `Verify ElevenLabs, Resend and Meta webhooks over raw bytes`
+
+### Task 0.3: Model layer (port) and `model_config` loading
+
+**Files:** Create `api/_lib/models.ts` (port of `../charlie/api/_lib/models.ts`), `api/_lib/jobctx.ts` (port), `test/models.test.ts`. Modify `test/_fakes.ts` if `onModel` needs `finish_reason` support.
+
+**Interfaces:**
+- `type Role = "extract"|"needs"|"writer"|"checker"|"safety"|"voice"|"summary"`.
+- `askJSON<T>(role: Role, prompt: string, opts: { maxTokens?: number; schema?: (x: unknown) => x is T; jsonMode?: boolean; deadlineMs?: number; sessionId?: string }): Promise<{ value: T; model: string; usage: {in: number; out: number} }>`.
+- `askText(role, prompt, opts)` same shape with `value: string`.
+- `transcribeAudio(bytes: Uint8Array, mime: string, opts): Promise<{ text: string; segments?: {start: number; end: number; text: string}[]; language?: string }>` using the `voice` row (`provider` openrouter|groq|openai).
+- `HARD_FALLBACKS: string[]` (copy Charlie's current list), `MIN_MAX_TOKENS = 1200`, `loadModelConfig(role): Promise<ModelConfig>` cached 60 s.
+- Errors: `ModelUnavailable`, `ModelBadRequest`, `DeadlineError`.
+
+- [ ] **Step 1: Failing tests** `[C-1500]…[C-1525]`: scripted gateway returns `finish_reason: "length"` once → second call has doubled `max_tokens`; 429 → fallback called with no delay (fake clock unchanged); 400 → `ModelBadRequest`, no fallback; fences/trailing commas/prose → parsed; row disabled → fallbacks + incident; cache 60 s.
+- [ ] **Step 2–4:** red → port → green. **Step 5: Commit** `Port the model layer: roles from model_config, fallbacks, truncation retries`
+
+### Task 0.4: Queue, tracking, alerts, email (ports)
+
+**Files:** Create `api/_lib/queue.ts`, `api/_lib/track.ts`, `api/_lib/alerts.ts`, `api/_lib/email.ts`, `api/worker.ts`, `test/queue.test.ts`, `test/alerts.test.ts`. Port from Charlie's files of the same names; `email.ts` gains `sendEmailTo(msg & { to: string[]; replyTo?: string; attachments?: {filename: string; content: Buffer}[]; idempotencyKey?: string })`.
+
+**Interfaces:**
+- `enqueue(kind: JobKind, sessionId: string | null, payload: object, opts?: { runAfter?: Date; dedupeKey?: string }): Promise<string>`.
+- `JobKind = "ingest_transcript"|"store_audio"|"extract_facts"|"analyse_needs"|"match"|"write_quote"|"check_quote"|"notify_broker"|"send_quote"|"forget_client"|"transcribe_meeting"|"label_speakers"`.
+- `drain(opts: DrainOptions): Promise<DrainReport>`; `registerHandler(kind, fn: (job: JobRow, ctx: JobCtx) => Promise<void>)`.
+- Fencing: `lock_timeout` 120 s, `touchJob` every 30 s, `stillOwnJob`, per-session serialisation, 3 parallel sessions, backoff 10/60/300 s, 3 attempts then `failed` + incident.
+- `track(event, props)`, `trackFailure(event, message, {severity, alert, fingerprint, summary})`, `runAlerts()`; `incidents` table semantics as Charlie.
+- `api/worker.ts`: `POST/GET /api/worker` with `WORKER_SECRET` or `CRON_SECRET` (`?tick=1`); 240 s budget; hand-on self-call.
+
+- [ ] **Step 1: Failing tests** `[C-0485]…[C-0499]`, `[C-1597]…[C-1610]`, `[C-1541][C-1548][C-1550][C-1552]`.
+- [ ] **Step 2–4.** **Step 5: Commit** `Port the job queue, tracking, alerts and email sender`
+
+### Task 0.5: `vercel.json`, health skeleton, static security tests
+
+**Files:** Create `vercel.json`, `api/health.ts`, `test/health.test.ts`, `test/security-static.test.ts`, `scripts/preview-quote.mjs` (smoke stub that exits 0 with "no renderer yet" until Task 6.4), `docs/VERIFIED.md` rows filled for Vercel/Supabase/OpenRouter/Resend.
+
+**Interfaces:** `GET /api/health` → SPEC §12 fields (services from env only in this task; counts added in Task 11.2). `?ping=1` → `{ok:true}` after `select 1`.
+
+- [ ] **Step 1: Failing tests** `[C-1529][C-1535][C-1537][C-1539]`, static `[C-1572][C-1573][C-1592][C-1593][C-1439]` (the static tests grep `api/` and `public/`; they pass trivially now and bite later).
+- [ ] **Step 2–4.** Functions in `vercel.json`: `api/voice.ts` 60 s/1024 MB, `api/worker.ts` 300 s, `api/app.ts` 30 s, `api/meeting.ts` 60 s, `api/render-pdf.ts` 120 s/2048 MB with `includeFiles` for chromium, `api/health.ts` 15 s, `api/cron/*` 120 s; crons `/api/worker?tick=1`, `/api/cron/retention`, `/api/cron/keepalive`, `/api/cron/freshness` at schedules the Hobby plan allows (record the allowed minimum in VERIFIED.md; if once a day, the worker's hand-on and the webhook's kick carry the load, as in Charlie).
+- [ ] **Step 5: Commit** `Vercel config, health skeleton, static security tests`
+
+**Phase 0 gate:** `npm run verify` green (criteria check will fail on untested ids — run `--count` only until Phase 12; CI's `--check` step is added in Task 12.2). Push.
+
+---
+
+## Phase 1 — Database and seeds
+
+### Task 1.1: Migrations
+
+**Files:** Create `db/0001_core.sql` (brokers, broker_users, login_codes, sessions_auth, clients, sessions, turns, recordings, consents, callbacks, client_messages, meeting_chunks), `db/0002_model_config.sql`, `db/0003_facts.sql` (facts, fact_refusals), `db/0004_catalogue.sql` (product_categories, products, product_pricing, disclosures), `db/0005_quotes.sql` (needs, recommendations, quotes, deliveries, hardship_notes), `db/0006_platform.sql` (jobs + `claim_job` function, webhook_events, safety_events, usage_ledger, audit_log, incidents, storage buckets `recordings` and `quotes` private), `db/0007_rls.sql` (enable on all; policies on the three public tables), `test/rls.test.ts`, `test/migrations.test.ts`.
+
+Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.value_min/value_max numeric`, `sessions.provider_analysis jsonb`, `sessions.provider_summary text`, `sessions.provider_cost numeric`, `sessions.turn_count int`, `sessions.continues_session_id uuid`, `clients.whatsapp_e164`, `clients.last_inbound_at`, `recommendations.replaces_fact_id uuid`, `quotes.flags text[]`, `brokers.voice_id text`, `brokers.agent_llm text`, `webhook_events.processed_at`, `jobs.dedupe_key text unique`, `jobs.status check in ('queued','running','done','failed','cancelled','skipped')`.
+
+- [ ] **Step 1: Failing tests** `[C-1567][C-1568][C-1569][C-1570][C-1571][C-1576][C-1577][C-1578][C-1579][C-1580][C-1089]` — `rls.test.ts` parses every `CREATE TABLE` in `db/*.sql` and asserts an `ENABLE ROW LEVEL SECURITY` in the same file, the policy set, `created_at` on every table, `auto_send default false`, `claim_job` is `SECURITY DEFINER SET search_path`; `migrations.test.ts` runs each file twice against `TEST_DATABASE_URL` when set, else prints "skipped: no TEST_DATABASE_URL" (`[C-1575]`).
+- [ ] **Step 2–4.** **Step 5: Commit** `Migrations 0001–0007: schema, model_config, catalogue, quotes, platform, RLS`
+
+### Task 1.2: Seeds — categories, demo catalogue, pricing, disclosures, model_config
+
+**Files:** Create `seed/categories.json` (13 from SPEC §4 with `need_kinds`), `seed/products.json` (24 demo products per SPEC §8.3, each with `summary` ≤ 60 words, `eligibility` JSON, `exclusions`, `keywords`, `min/max_age`, `min/max_cover`, `term_rules`, `verified_on: "2026-10-31"`, `is_demo: true`, `external_id`), `seed/pricing.json` (6–8 bands per product; life/IP/disability/CI `rate_per_1000`, funeral/gap/credit `flat_cents` or rate, smoker split for life/CI), `seed/disclosures.json` (ZA keys per C-1451 with `required`/`condition`), `db/0008_seed.sql` (generated INSERTs from the JSON by `scripts/seed-sql.ts`), `scripts/seed-sql.ts`, `test/seed.test.ts`, `api/_lib/catalogue-load.ts` (`loadCatalogue(brokerId): Promise<{products, pricing, categories, disclosures}>` with the broker-over-demo rule and a 60 s cache).
+
+- [ ] **Step 1: Failing tests** `[C-0815][C-0816][C-1451][C-1452][C-1455][C-1526]` plus `[C-0845][C-0846][C-0848]` for `loadCatalogue`.
+- [ ] **Step 2–4.** **Step 5: Commit** `Demo catalogue, pricing bands, disclosures and model roles as data`
+
+### Task 1.3: The paste-ready Supabase prompt
+
+**Files:** Create `scripts/supabase-prompt.ts`, `docs/SUPABASE-PROMPT.md` (generated), `test/supabase-prompt.test.ts`. Model on `../charlie/docs/SUPABASE-PROMPT.md`: a precheck query that prints the project ref expectation, the SQL of every `db/*.sql` in order, one check query per migration printing `found` vs `expected`, and the success table at the bottom.
+
+- [ ] **Step 1: Failing test** `[C-1574]` regenerates and diffs. **Step 2–4.** **Step 5: Commit** `Generate the paste-ready Supabase prompt from the migrations`
+
+**Phase 1 gate.** Push.
+
+---
+
+## Phase 2 — Figures, redaction, facts, distress (pure code, parallel-safe with Phase 3)
+
+### Task 2.1: Figures
+
+**Files:** Create `api/_lib/figures.ts`, `test/figures.test.ts`.
+
+**Interfaces:**
+- `figuresFrom(text: string, ctx?: { moneyContext?: boolean }): Set<number>` — every way of saying money in C-0563–C-0580; bare small numbers ("about ten") scaled ×1000 only when `moneyContext`.
+- `ageFrom(text: string, today: Date): { age?: number; band?: AgeBand; approx: boolean } | null` (C-0581–C-0586).
+- `countsFrom(text: string): { dependants?: number; children?: number; children_under_18?: number; parents?: number }` (C-0587–C-0590).
+- `isApprox(text: string): boolean`; `rangeFrom(text): {min, max, mid} | null`; `bandFor(age): AgeBand`; `AgeBand = "18-24"|"25-34"|"35-44"|"45-54"|"55-64"|"65+"`.
+- `formatRand(cents: number): string`; `parseMoneyInput(s: string): number | null` (dashboard inputs, C-1163).
+
+- [ ] **Step 1: Failing tests** one `test()` per criterion C-0563…C-0590, C-0525, C-0526, C-0531, C-0532.
+- [ ] **Step 2–4.** **Step 5: Commit** `Parse money, ages and counts the way South Africans say them`
+
+### Task 2.2: Redaction
+
+**Files:** Create `api/_lib/redact.ts`, `test/redact.test.ts`.
+
+**Interfaces:** `redact(text: string): { text: string; found: RedactionKind[] }` with `RedactionKind = "id_number"|"card"|"account"|"password"|"policy"`; `IDENTIFIER: RegExp` exported for `facts.ts`; `MEDICAL_TERMS: string[]`.
+
+- [ ] **Step 1: Failing tests** `[C-0175]…[C-0182]`, `[C-1429][C-1430]` (the fixture sweep part is wired in Task 4.4; here, unit cases).
+- [ ] **Step 2–4.** **Step 5: Commit** `Redact identifiers before anything is stored`
+
+### Task 2.3: Facts — `factUpdates()` and the slot rules
+
+**Files:** Create `api/_lib/facts.ts`, `api/_lib/factkinds.ts` (the relation/label table from SPEC §7.3 with aliases: "funeral policy"→funeral, "own business"→self_employed, "bond"→home_loan, "RA"→retirement, "gap cover"→medical_gap, …), `test/facts.test.ts`, `test/_facts.ts` (helpers `fact(rel,label,value,opts)`, `clientTurn(idx,text)`).
+
+**Interfaces:**
+- `factUpdates(raw: unknown, turns: Turn[], opts: { source: "extract"|"tool"|"readback"|"broker"; today: string; sessionMode: SessionMode }): { kept: FactDraft[]; refused: { label: string; reason: RefusalReason; raw: unknown }[] }` implementing SPEC §7.3 rules 1–7; `RefusalReason = "relation"|"not_said"|"no_turn"|"ambiguous_turn"|"figure_not_said"|"negated"|"hypothetical"|"past"|"someone_else"|"identifier"|"not_a_kind"|"over_cap"|"bad_value"`.
+- `slotOf(rel, label): string` (has_cover/lacks_cover share a slot per category; owes per kind; is per label).
+- `applyFacts(sessionId, clientId, drafts: FactDraft[]): Promise<{ inserted: number; superseded: number }>` — supersede-by-slot, `supersedes_id`, idempotent on identical value (`last_seen` only).
+- `confirmReadback(sessionId, readbackTurn: Turn, clientReply: Turn): Promise<{ confirmed: number; incomplete: string[] }>` (C-0595, C-0596, C-0599).
+- `applyCorrection(sessionId, correctionTurn: Turn, proposals: FactDraft[])` (C-0591–C-0600).
+
+- [ ] **Step 1: Failing tests** every row C-0500…C-0562, C-0591…C-0600, C-0615, C-0226, C-0261, C-0262, C-0267–C-0269, C-0271, C-0274–C-0276, C-0335–C-0339 (slot semantics; the HTTP side is Task 3.2), C-1346, C-1435.
+- [ ] **Step 2–4.** **Step 5: Commit** `Facts: keep only what the client said, with the turn that says it`
+
+### Task 2.4: Distress
+
+**Files:** Create `api/_lib/distress.ts` (port `saysMoneyTrouble`, `saysSevereMoneyTrouble`, `saysSteadied` from `../charlie/api/_lib/safety.ts`, add SA phrasing), `test/distress.test.ts`.
+
+- [ ] **Step 1: Failing tests** `[C-0205]…[C-0213]`, `[C-0549]`. **Step 2–4.** **Step 5: Commit** `Distress rules with South African phrasing`
+
+---
+
+## Phase 3 — The voice HTTP surface and ingestion
+
+### Task 3.1: `/api/voice/init`
+
+**Files:** Create `api/voice.ts` (one handler dispatching on path: `/init`, `/tool/:name`, `/post-call`), `api/_lib/voice-init.ts`, `api/_lib/phones.ts` (port `normaliseZa(raw): string | null` → E.164), `test/voice-init.test.ts`.
+
+**Interfaces:** `handleInit(body: unknown, headers): Promise<{ status: 200; json: InitResponse }>` where `InitResponse = { type: "conversation_initiation_client_data"; dynamic_variables: Record<string,string>; conversation_config_override?: { agent: { first_message: string } } }` (field names confirmed against VERIFIED.md row "initiation webhook" before coding; if they differ, the task updates SPEC §3.1 and this plan). Defaults on any error; 2 s internal timeout with background write.
+
+- [ ] **Step 1: Failing tests** C-0001…C-0030, C-0484. **Step 2–4.** **Step 5: Commit** `Voice init: who is calling, and never a non-200`
+
+### Task 3.2: Server tools
+
+**Files:** Create `api/_lib/voice-tools.ts`, `test/voice-tools.test.ts`. Modify `api/voice.ts`.
+
+**Interfaces:** `handleTool(name: ToolName, body, headers): Promise<{status: number; json: object}>`; `ToolName = "save_fact"|"check_existing_cover"|"lookup_categories"|"request_callback"|"mark_hardship"|"set_channel"`; rate limit 60/min/conversation in memory + `tool_calls` count on the session; placeholder turns `[pending]` with `t_start_secs`; `normaliseEmail(s)`; uses `factUpdates` with `source: "tool"`.
+
+- [ ] **Step 1: Failing tests** C-0301…C-0372 (minus the ingest-side rows C-0316, C-0317, C-0353, C-0355, C-0363 which Task 3.4 owns), C-0166, C-0284…C-0288.
+- [ ] **Step 2–4.** **Step 5: Commit** `Server tools the agent calls mid-call`
+
+### Task 3.3: Post-call webhook
+
+**Files:** Create `api/_lib/post-call.ts`, `test/post-call.test.ts`, `test/_elevenlabs.ts` (event factory: `signedTranscriptEvent(conv: ScriptedConversation, secret, opts)`, `signedAudioEvent(...)`, builds the current payload shape recorded in VERIFIED.md). Modify `api/voice.ts` (raw body read, `bodyParser: false`).
+
+- [ ] **Step 1: Failing tests** C-0400…C-0428, C-0434, C-1594, C-1595. **Step 2–4.** **Step 5: Commit** `Post-call webhook: verify, store, enqueue, answer fast`
+
+### Task 3.4: `ingest_transcript`
+
+**Files:** Create `api/_lib/ingest.ts`, `test/ingest.test.ts`. Registers the handler in `queue.ts`.
+
+**Interfaces:** `ingestTranscript(job)`: upsert session, turns (redacted), resolve placeholders (C-0316/0317), consent detection (`consentFrom(turns)` → granted/declined/inferred with the agreement word list), duration/cost → `usage_ledger`, `provider_analysis`, DC cross-check (`crossCheckDc(session)` after facts exist — enqueued as part of `extract_facts` completion), evaluation handling, `turn_count`, `processed_at`; enqueue `extract_facts`. Exports `consentFrom`, `AGREEMENT_WORDS`.
+
+- [ ] **Step 1: Failing tests** C-0441…C-0484 (except C-0481–C-0483 e2e), C-0316, C-0317, C-0353, C-0426, C-1436, C-0113, C-0118, C-0199, C-0461…C-0472, C-0617…C-0619.
+- [ ] **Step 2–4.** **Step 5: Commit** `Ingest the transcript: turns, consent, cost, cross-checks`
+
+### Task 3.5: `store_audio` and recordings
+
+**Files:** Create `api/_lib/recordings.ts`, `test/recordings.test.ts`. Modify `ingest.ts` for linking.
+
+- [ ] **Step 1: Failing tests** C-0427…C-0440 (store side), C-0114, C-1322, C-1560 (storage-full guard stub reading `limits.ts` later — write it to call a `storageBytes()` function in `limits.ts` created in Task 7.6; until then a local helper).
+- [ ] **Step 2–4.** **Step 5: Commit** `Store call audio privately with a delete-after date`
+
+**Phase 3 gate.** Push.
+
+---
+
+## Phase 4 — Extraction, the conversation checker, the prompt, the fixtures
+
+### Task 4.1: Conversation fixtures and the scripted-conversation format
+
+**Files:** Create `test/fixtures/conversations/*.json` — the 40 named in SPEC §14 (happy-path, declined-consent, unclear-consent, dropped, silence, misheard-age, hardship, hardship-missed, what-do-you-offer, offers-id-number, someone-elses-cover, hypothetical-cover, negated-cover, two-needs-over-budget, known-client, web-no-caller-id, prompt-injection, afrikaans-money, approximate-figures, long-story, interrupted, medical-detail, agent-advised, agent-priced, no-channel, whatsapp-channel, email-channel, callback-request, budget-unknown, group-cover, replacement-funeral, no-product-fits, age-70, smoker, self-employed, retired, student, meeting (speaker-labelled), meeting-unknown-speakers, second-call-correction), `test/fixtures/README.md` describing the format `{ id, mode, caller_id, turns: [{role, text, t, tool_calls?, flags?}], expect: {...} }`, `test/fixtures.test.ts` (every fixture parses; ids unique; every §3 question stem appears in happy-path).
+
+- [ ] **Step 1: Failing test** `fixtures.test.ts` `[C-1429][C-1430][C-1431][C-1432]` sweep (runs `redact` + later `factUpdates` over all fixtures — the facts part is enabled in Task 4.2). **Step 2–4.** **Step 5: Commit** `Forty scripted conversations the whole pipeline is tested on`
+
+### Task 4.2: `extract_facts`
+
+**Files:** Create `api/_lib/extract.ts`, `api/_lib/prompts.ts` (`base()` voice rules ported; `extractPrompt(turns, kinds)`), `test/extract.test.ts`.
+
+**Interfaces:** `extractFacts(job)`: build prompt (client turns as data block, agent turns elided to `[agent asked about X]` using the §3 question stems, middle-truncation to 12k chars), `askJSON("extract")`, `factUpdates(..., {source:"extract"})`, `applyFacts`, then `applyCorrection`/`confirmReadback` over read-back turns (detected by the "read back" stem), DC cross-check, `injection_suspected` detection (`INJECTION_RE`), enqueue `analyse_needs`.
+
+- [ ] **Step 1: Failing tests** C-0601…C-0614, C-0620, C-1345, C-1434, C-0226/C-0228 via fixture `medical-detail`. **Step 2–4.** **Step 5: Commit** `Extract facts from the client's own turns only`
+
+### Task 4.3: The post-hoc conversation checker
+
+**Files:** Create `api/_lib/checker.ts`, `test/checker.test.ts`.
+
+**Interfaces:** `checkConversation(session, turns): Promise<CheckerResult>` writing one `safety_events` row per check listed in criteria 02 (`consent_wording`, `consent_before_questions`, `questions_after_decline`, `one_question_per_turn`, `skip_honoured`, `repeat_question`, `voice_rules`, `jargon`, `names_repeated`, `unsaved_answer`, `pressing`, `interrupted`, `provider_named`, `price_on_call`, `advice_on_call`, `promise`, `identifier_requested`, `medical_detail_requested`, `hardship_handled`, `readback_done`, `readback_incomplete`, `readback_invented`, `argued_correction`, `channel_captured`, `category_list_invalid`); regex tables exported (`ADVICE_RE`, `PRICE_RE`, `PROMISE_RE`, `JARGON`, `QUESTION_STEMS`). Called from `ingest.ts` after turns are stored; `block` outcomes set `quotes` to `held` later (Task 6.2 reads them).
+
+- [ ] **Step 1: Failing tests** every `checker` row in criteria 02 (C-0104–C-0106, C-0116, C-0122–C-0123, C-0127–C-0130, C-0132, C-0136–C-0137, C-0139–C-0140, C-0151–C-0153, C-0155–C-0157, C-0159–C-0160, C-0163–C-0165, C-0167–C-0168, C-0170, C-0173–C-0174, C-0187–C-0196, C-0200, C-0214–C-0216, C-0225, C-0227, C-0231, C-0234, C-0238, C-0242, C-0246–C-0251, C-0253, C-0255, C-0260, C-0264–C-0266, C-0272, C-0280–C-0283, C-0295–C-0298), C-1463.
+- [ ] **Step 2–4.** **Step 5: Commit** `Check every agent turn after the call, and write what was found`
+
+### Task 4.4: The agent prompt renderer and its test
+
+**Files:** Create `api/_lib/agent-prompt.ts` (`renderAgentPrompt(vars): { prompt: string; firstMessage: string; tools: ToolSpec[]; dataCollection: DcField[]; evaluation: EvalCriterion[] }` reading `docs/AGENT-PROMPT.md` at build time via `scripts/push-agent.ts`; in `api/` it reads a generated `api/_lib/agent-prompt.generated.ts` so the function has no filesystem access at runtime), `scripts/gen-agent-prompt.ts`, `test/agent-prompt.test.ts`.
+
+- [ ] **Step 1: Failing tests** every `prompt` row in criteria 02 (C-0100–C-0103, C-0107–C-0108, C-0117, C-0121, C-0124–C-0126, C-0131, C-0133–C-0135, C-0138, C-0141–C-0150, C-0154, C-0158, C-0161–C-0162, C-0169, C-0171–C-0172, C-0183–C-0186, C-0201–C-0204, C-0223–C-0224, C-0229–C-0230, C-0237, C-0243–C-0245, C-0254, C-0256–C-0259, C-0273, C-0277–C-0279, C-0292–C-0294, C-0300), C-1433.
+- [ ] **Step 2–4.** **Step 5: Commit** `The agent prompt is rendered from the document, never hand-edited`
+
+**Phase 4 gate.** Push.
+
+---
+
+## Phase 5 — Needs, price, match
+
+### Task 5.1: Needs
+
+**Files:** Create `api/_lib/needs.ts`, `test/needs.test.ts`. Modify `prompts.ts` (`needsPrompt(facts, candidates)`).
+
+**Interfaces:** `needsFrom(facts: Fact[], country: string): NeedDraft[]` (SPEC §8.1 rules, deterministic, `basis` fact ids, `priority`, `cover_rule` output `{ default_cover?: number; min_cover?: number; flags: string[] }`); `analyseNeeds(job)`: rules → model re-order/annotate/add-with-citation → `needs` rows; stabilising short-circuit; enqueue `match`.
+
+- [ ] **Step 1: Failing tests** C-0700…C-0752. **Step 2–4.** **Step 5: Commit** `Needs from the facts, rules first, the model may only annotate`
+
+### Task 5.2: Price
+
+**Files:** Create `api/_lib/price.ts`, `test/price.test.ts`.
+
+**Interfaces:** `premiumFor(product, pricing: PricingRow[], args: { coverCents: number; age: number; smoker: boolean | null; today: Date }): { premiumCents: number; basis: PremiumBasis } | { premiumCents: null; reason: "no_rate"|"no_smoker_rate" }`; `PremiumBasis = { pricing_id, rate_per_1000?, flat_cents?, age_used, smoker_used, assumed_smoker?, cover_used, verified_on, stale: boolean }`; `isStale(verifiedOn, today)` (> 90 days).
+
+- [ ] **Step 1: Failing tests** C-0796…C-0811, C-0789, C-0801. **Step 2–4.** **Step 5: Commit** `Premiums from pricing bands, in integer cents, with a staleness flag`
+
+### Task 5.3: Match
+
+**Files:** Create `api/_lib/match.ts`, `api/_lib/eligibility.ts` (tiny evaluator for `{all|any|fact,in|eq|gte|lte}`), `test/match.test.ts`.
+
+**Interfaces:** `selectProduct(need: Need, facts: Fact[], catalogue: Catalogue, today: Date): Selection` where `Selection = { product: Product | null; coverCents: number; termMonths: number | null; premium: PremiumResult; considered: Considered[]; flags: string[]; replacesFactId?: string }`; `allocateBudget(selections, budgetCents | null, incomeCents | null): { kept: Selection[]; moved: {selection, reason: "budget"|"affordability"}[]; flags }`; `runMatch(job)`: writes `recommendations`, `quotes` draft with `total_premium_cents`, `flags`; enqueue `write_quote`. Deterministic; pure except the DB writes in `runMatch`.
+
+- [ ] **Step 1: Failing tests** C-0761…C-0795, C-0817, C-0821…C-0850 (non-app rows), C-0263, C-0753–C-0760 (pipeline rows via a mini-pipeline test on the fakes). **Step 2–4.** **Step 5: Commit** `One product per need, every other one listed with why not`
+
+**Phase 5 gate.** Push.
+
+---
+
+## Phase 6 — Write, check, render
+
+### Task 6.1: Writer
+
+**Files:** Create `api/_lib/write.ts`, `test/write.test.ts`. Modify `prompts.ts` (`writerPrompt(ctx)` per SPEC §7.7 with facts and figures as data, the jargon replacement table, `REPLY_LIMITS = { opening: 40, why: 60, alternative_if: 25 }`).
+
+**Interfaces:** `writeQuote(job)`: for each recommendation build the context, `askJSON("writer")`, trim to limits at sentence boundaries, jargon replacement, store `why`, `alternative_if`, `quotes.opening`; on fallback (`no why`) the fixed sentence; enqueue `check_quote`. `allowedNumbers(quote, recs, facts): Set<string>` exported for the checker.
+
+- [ ] **Step 1: Failing tests** C-0819, C-0909, C-0987…C-0990, C-0614. **Step 2–4.** **Step 5: Commit** `The writer repeats the numbers it is given and explains one product per need`
+
+### Task 6.2: Quote checker and the judgement layer
+
+**Files:** Create `api/_lib/check.ts`, `api/_lib/safety.ts` (port Charlie's engine selection: Jev → model → none, `recordSafetyEvent`), `api/_lib/jev.ts` (port), `test/check.test.ts`, `test/safety.test.ts`.
+
+**Interfaces:** `checkQuoteText(text, allowed: Set<string>, facts, products, disclosures): RuleReport` (numbers, menu, you-told-me by confidence, claims, stale hedge, disclosures, FSP, demo notice); `judgeQuote(quote, facts): Promise<{ engine: Engine; score: number | null; outcome }>`; `checkQuote(job)`: rules → regenerate once on fail → judge → status `checked` or `held` with `checker_report`; also folds in `agent_advised` blocks from the conversation checker and `income_uncertain`; enqueue `notify_broker` (and `send_quote` directly when `auto_send` and clean and all cited facts confirmed — the status machine helper lives in Task 7.3; here it calls `advanceAfterCheck(quote)` defined there, so write that stub now).
+
+- [ ] **Step 1: Failing tests** C-0900…C-0946 (except render rows), C-1355, C-1457…C-1470 (safety events), C-0197–C-0198, C-0620.
+- [ ] **Step 2–4.** **Step 5: Commit** `Check every number, every claim, and name which engine checked it`
+
+### Task 6.3: Document parts and the quotation document
+
+**Files:** Create `api/_lib/docparts.ts` (port the table/row/heading helpers and colour constants from `../charlie/api/_lib/plandoc.ts`: `page(title, bodyTables, opts)`, `section(heading)`, `kv(rows)`, `para(text)`, `esc()`), `api/_lib/quotedoc.ts` (`quoteDocHTML(data: QuoteDocData): string` with sections SPEC §9 1–9), `api/_lib/holidays.ts` (ZA public holidays 2026–2028; `addWorkingDays(date, n)`), `api/_lib/reasons.ts` (`reasonText(code): string` for considered reasons), `test/quotedoc.test.ts`, `test/holidays.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-0947…C-0969, C-0972…C-0986, C-0991…C-0993, C-0806, C-0810, C-0818, C-0824, C-0839, C-0840, C-0847, C-0793, C-0933, C-0934, C-1088, C-1453, C-1454, C-0270. The CSS grep rows assert over the rendered string, and `npm run grep-doc-css` now has files to scan.
+- [ ] **Step 2–4.** **Step 5: Commit** `The quotation document: tables and inline hex, nine sections, prints`
+
+### Task 6.4: PDF rendering and the print smoke
+
+**Files:** Create `api/render-pdf.ts` (port of Charlie's `render-pdf.ts` + `chromium-env.ts` + `pdfclient.ts`: `renderPdf(html): Promise<Buffer>` behind `WORKER_SECRET`), `api/_lib/pdf.ts`, `scripts/preview-quote.mjs` (replaces the stub: renders the `two-needs-over-budget` fixture's quote to `preview/quote.pdf`, checks page count ≥ 2 and that the text layer has the FSP and "Indicative" — use `pdf-parse`-free approach: Chromium's own `page.pdf` plus `page.evaluate` text before printing), `test/render-pdf.test.ts`.
+
+- [ ] **Step 1: Failing test** C-0970, C-0971 (script exit code checked by `test/render-pdf.test.ts` spawning it with `--smoke`). **Step 2–4.** **Step 5: Commit** `Render the quotation to PDF in Chromium, and prove it prints`
+
+### Task 6.5: Record of advice
+
+**Files:** Create `api/_lib/roa.ts` (`roaHTML(session, facts, needs, recs, quote, consents, safetyEvents, audit, broker, user): string`), `test/roa.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1191…C-1204 (render rows), C-1441…C-1450, C-0844, C-1359, C-1424. **Step 2–4.** **Step 5: Commit** `The record of advice, section by section, with the turn each fact came from`
+
+**Phase 6 gate.** `npm run grep-doc-css` and the print smoke green. Push.
+
+---
+
+## Phase 7 — Delivery
+
+### Task 7.1: Email delivery
+
+**Files:** Create `api/_lib/deliver-email.ts`, `api/resend-webhook.ts`, `test/email.test.ts`. Uses `email.ts` from Task 0.4.
+
+- [ ] **Step 1: Failing tests** C-1017…C-1036, C-0976. **Step 2–4.** **Step 5: Commit** `Send the quotation by email, and hear back from Resend`
+
+### Task 7.2: WhatsApp (port) and the client's replies
+
+**Files:** Create `api/_lib/wa.ts` (port of Charlie's `wa.ts`: `sendText`, `sendButtons`, `sendTemplate`, `sendDocument`, `uploadMedia`, `parseWebhook`, `withinServiceWindow`, limits), `api/_lib/deliver-wa.ts`, `api/wa.ts` (verify handshake + inbound + statuses, raw body), `api/_lib/wa-inbound.ts`, `test/wa.test.ts`, `test/wa-inbound.test.ts`, `docs/WHATSAPP-TEMPLATES.md` (the two template texts to submit to Meta, with placeholders, no prices).
+
+- [ ] **Step 1: Failing tests** C-1037…C-1058, C-1071…C-1084, C-1415 (confirmation before deletion). **Step 2–4.** **Step 5: Commit** `WhatsApp: the quote as a template plus document, and what a client may reply`
+
+### Task 7.3: The quote status machine, approve, fallback, auto-send
+
+**Files:** Create `api/_lib/deliver.ts`, `test/deliver.test.ts`.
+
+**Interfaces:** `approveQuote(quoteId, by: {userId} | {system: "auto_send"}, opts: { reviewedHeld?: boolean }): Promise<Approved | Blocked>` with `Blocked = { status: 422|409|404; reason: "unconfirmed_facts"|"held_numbers"|"superseded"|"not_found"|"held_unreviewed"; factIds?: string[] }`; `advanceAfterCheck(quote)`; `sendQuote(job)` (email or WhatsApp by `clients.preferred_channel`, PDF first, quota check via `limits.emailsToday()`, `run_after` next UTC midnight when ≥ 100); `fallbackToEmail(quoteId, by, opts: { confirmedConsent?: boolean })`; `transition(quoteId, to, by, note?)` writing `audit_log`.
+
+- [ ] **Step 1: Failing tests** C-1000…C-1016, C-1059…C-1070, C-1085…C-1089, C-1440, C-1062. **Step 2–4.** **Step 5: Commit** `Nothing reaches a client until a broker approves it`
+
+### Task 7.4: Signed links
+
+**Files:** Create `api/_lib/links.ts`, `api/q.ts` (`GET /q/:quoteId?exp&sig` serves the PDF inline and marks read), `test/links.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1581…C-1586. **Step 2–4.** **Step 5: Commit** `Signed, expiring links to the quotation`
+
+### Task 7.5: Notify broker
+
+**Files:** Create `api/_lib/notify.ts`, `test/notify.test.ts`.
+
+**Interfaces:** `notifyBroker(job)`: subject/body variants (normal, hardship, dropped, abandoned, declined one-liner, meeting, no-channel, callback), channel by `brokers.notify_channel`, link `/app/calls/{id}`.
+
+- [ ] **Step 1: Failing tests** C-0115, C-0220, C-0240–C-0241, C-0289, C-0355, C-0482–C-0483, C-1054, C-1358, C-1440. **Step 2–4.** **Step 5: Commit** `Tell the broker what landed, in one line`
+
+### Task 7.6: Limits
+
+**Files:** Create `api/_lib/limits.ts`, `test/limits.test.ts`.
+
+**Interfaces:** `agentMinutesThisMonth()`, `emailsToday()`, `openrouterToday()`, `storageBytes()`, `budgetCheck(role): "ok"|"skip"` (critical roles never skipped), thresholds → `trackFailure` with daily/monthly fingerprints.
+
+- [ ] **Step 1: Failing tests** C-1553…C-1560, C-1069, C-1323, C-1545–C-1547. **Step 2–4.** **Step 5: Commit** `Count what the free tiers give us, and warn at 80%`
+
+**Phase 7 gate.** Push.
+
+---
+
+## Phase 8 — The broker dashboard
+
+### Task 8.1: Login and sessions
+
+**Files:** Create `api/_lib/auth.ts`, `api/app.ts` (router: pages and `/app/actions`), `api/_lib/html.ts` (layout, escaping, CSRF token field), `test/auth.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1100…C-1120, C-1251…C-1254. **Step 2–4.** **Step 5: Commit** `Magic-link login for broker users`
+
+### Task 8.2: The calls list and `calls.json`
+
+**Files:** Create `api/_lib/app-list.ts`, `test/app.test.ts` (grows through Phase 8).
+
+- [ ] **Step 1: Failing tests** C-1121…C-1138, C-0120. **Step 2–4.** **Step 5: Commit** `The calls list, broker-scoped, polling`
+
+### Task 8.3: Call detail: transcript, audio, facts actions
+
+**Files:** Create `api/_lib/app-call.ts`, `api/_lib/app-actions.ts` (every action id → handler; `rerunPipelineFrom(sessionId, step)`), modify `test/app.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1139…C-1168, C-0235, C-0616, C-1427, C-1011, C-0756–C-0757, C-1189. **Step 2–4.** **Step 5: Commit** `Call detail: every fact with the second it was said`
+
+### Task 8.4: Recommendations, versions, status, outcome
+
+**Files:** Modify `app-call.ts`, `app-actions.ts`; create `api/_lib/versions.ts` (`newVersion(quoteId, reason, by): Promise<string>` copying recs, superseding, re-running write/check), modify `test/app.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1169…C-1190, C-0994…C-0999, C-0795, C-0829–C-0830, C-0835, C-0850, C-0911, C-1015, C-1068. **Step 2–4.** **Step 5: Commit** `Swap, edit, remove, re-match: every change is a new version`
+
+### Task 8.5: Settings and the catalogue upload
+
+**Files:** Create `api/_lib/catalogue.ts` (`validateCsv(text, brokerId): {rows, errors}`, `applyCatalogue(rows)`), `api/_lib/app-settings.ts`, `public/catalogue-template.csv`, `test/catalogue.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1217…C-1240, C-0812…C-0814, C-1090. **Step 2–4.** **Step 5: Commit** `Settings, and a catalogue upload that is all-or-nothing`
+
+### Task 8.6: Costs page
+
+**Files:** Create `api/_lib/app-costs.ts`; modify `test/app.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1241…C-1250, C-1562, C-1190. **Step 2–4.** **Step 5: Commit** `What each call cost, and what the month cost`
+
+### Task 8.7: Forget a client
+
+**Files:** Create `api/_lib/forget.ts` (`forgetClient(clientId, by): Promise<Counts>` enumerating tables from a single `CLIENT_TABLES` list that `test/forget.test.ts` cross-checks against the migrations), `test/forget.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1205…C-1216, C-1409…C-1420, C-1428, C-0236. **Step 2–4.** **Step 5: Commit** `Forget a client completely, and prove nothing is left`
+
+### Task 8.8: Operator admin
+
+**Files:** Create `api/admin.ts` (port the shape of Charlie's: incidents, failed jobs with retry, safety events by check, webhook log, model config, limits, assumptions), `test/admin.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-0487, C-1466, C-1609, C-1538. **Step 2–4.** **Step 5: Commit** `The operator view`
+
+**Phase 8 gate.** Push.
+
+---
+
+## Phase 9 — The ElevenLabs agent itself
+
+### Task 9.1: Push the agent from the repo
+
+**Files:** Create `scripts/push-agent.ts` (reads `renderAgentPrompt`, builds the agent JSON — prompt, first message, tools with URL `${PUBLIC_BASE_URL}/api/voice/tool/{name}` and header `x-call-secret`, data collection, evaluation criteria, post-call webhook URL, initiation webhook on with `first_message` override — `GET` the current agent, print a diff, `PATCH`/`PUT` on `--apply`; refuses without `ELEVENLABS_API_KEY`), `test/push-agent.test.ts` (builds the JSON against the fakes and asserts the tool list, the webhook URL and that no secret is in the printed diff), `docs/VERIFIED.md` rows for the Agents API shape.
+
+- [ ] **Step 1: Failing test** `[C-0166]`-adjacent build assertions and a new row if needed. **Step 2–4.** **Step 5: Commit** `Push the agent configuration from the repository`
+
+### Task 9.2: The demo page with the browser widget
+
+**Files:** Create `public/demo.html` (name + mobile form → starts the widget with dynamic variables `client_name`, `client_phone`; the embed per VERIFIED.md; a short "what will happen" panel; no Supabase, no secrets), `public/index.html` (one-paragraph landing: what Call is, a button to `/demo`, a link to `/app/login`; brand colours), `test/public.test.ts` (static: no keys, the agent id comes from a `data-agent-id` injected by `api/demo.ts` from `brokers.elevenlabs_agent_id`, not hardcoded), `api/demo.ts`.
+
+- [ ] **Step 1: Failing test** C-1573 (already) plus `public.test.ts` rows asserting the form fields and the absence of literals. **Step 2–4.** **Step 5: Commit** `The demo page: call the agent from a browser`
+
+### Task 9.3: Live check instructions
+
+**Files:** Create `HANDOFF.md` §1–§3: ElevenLabs account steps (agent created by the push script; webhook secret; tool secret; voice chosen; LLM chosen), Twilio trial steps (verify the demo callers' numbers; buy the one US number; import into ElevenLabs), what to watch on `/api/health` during the first real call, and the five live checks from SPEC §14.
+
+- [ ] **Step 1:** Write it. **Step 2:** Orchestrator reads it against SPEC §5 and VERIFIED.md. **Step 3: Commit** `Handoff: how to put a real call through`
+
+---
+
+## Phase 10 — In-person meeting mode
+
+### Task 10.1: The meeting page and upload endpoints
+
+**Files:** Create `public/meeting.html` (client picker, consent panel, "Client agreed" / "Client declined", `MediaRecorder` 60 s chunks with retry queue, timer, Stop, resume from `localStorage`), `api/meeting.ts` (`/start`, `/chunk`, `/finish`, `/upload`), `api/_lib/meeting.ts`, `test/meeting.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1300…C-1325 (page rows by static HTML/JS assertions; endpoint rows by handler calls). **Step 2–4.** **Step 5: Commit** `Record a meeting in the browser, in chunks, with consent first`
+
+### Task 10.2: Transcription and speaker labelling
+
+**Files:** Create `api/_lib/transcribe.ts` (port Charlie's provider routing; `transcribeMeeting(job)`, `labelSpeakers(job)` using `askJSON("summary")` with the broker's name and the addressee rule), `test/transcribe.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1326…C-1348 (non-app rows), C-1360. **Step 2–4.** **Step 5: Commit** `Transcribe the meeting and label who spoke, or say unknown`
+
+### Task 10.3: Meeting journey end to end
+
+**Files:** Create `test/journey-meeting.e2e.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1349…C-1358, C-1347–C-1348 (app side), C-0981. **Step 2–4.** **Step 5: Commit** `A meeting lands in the same dashboard as a call`
+
+**Phase 10 gate.** Push.
+
+---
+
+## Phase 11 — Operations
+
+### Task 11.1: Crons
+
+**Files:** Create `api/cron/retention.ts`, `api/cron/keepalive.ts`, `api/cron/freshness.ts`, `api/_lib/cron-auth.ts`, `test/retention.test.ts`, `test/cron.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1400…C-1408, C-1561, C-1563…C-1566, C-1596, C-1607, C-0440, C-1142. **Step 2–4.** **Step 5: Commit** `Retention, keep-alive and freshness on a schedule that fails closed`
+
+### Task 11.2: Health, complete
+
+**Files:** Modify `api/health.ts`, `test/health.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1530…C-1534, C-1536, C-1538, C-1540, C-1461, C-0306, C-0411, C-1025, C-1236. **Step 2–4.** **Step 5: Commit** `Health says what is configured, what is live, and what is running out`
+
+### Task 11.3: Alerts, complete
+
+**Files:** Modify `alerts.ts`, `test/alerts.test.ts`.
+
+- [ ] **Step 1: Failing tests** C-1542…C-1544, C-1549, C-1551, C-1437–C-1438, C-0304, C-0420. **Step 2–4.** **Step 5: Commit** `Alerts for the things that need a human`
+
+---
+
+## Phase 12 — The journeys end to end, criteria closure, handoff
+
+### Task 12.1: The call journey end to end
+
+**Files:** Create `test/journey.e2e.test.ts` (drives `api/voice.ts` handlers → worker drain → `api/app.ts` approve → delivery fakes, for the fixtures: happy-path email, whatsapp-channel, declined-consent, dropped, silence, hardship, misheard-age, prompt-injection, known-client second call, web-no-caller-id, two-needs-over-budget, no-product-fits, agent-advised, auto-send demo), `test/endpoints.e2e.test.ts` (every route answers; unknown route 404; methods).
+
+- [ ] **Step 1: Failing tests** every `journey.e2e` row still untagged: C-0109–C-0115, C-0118–C-0119, C-0197–C-0198, C-0217–C-0222, C-0232–C-0233, C-0236, C-0239–C-0241, C-0252, C-0289–C-0291, C-0299, C-0355, C-0363, C-0470, C-0481–C-0483, C-0620, C-0753–C-0760, C-0794, C-0910, C-1352–C-1353 (meeting ones already), plus timing `[C-0006][C-0403]` assertions.
+- [ ] **Step 2–4.** **Step 5: Commit** `The whole call, from the first webhook byte to the delivery row`
+
+### Task 12.2: Criteria closure
+
+- [ ] **Step 1:** `npm run criteria -- --missing`. For every remaining id: either add the test to the owning file (one executor per owning file, parallel-safe), or, if the criterion is wrong or duplicative, edit the row with a reason in the commit and note it in BEHAVIOR-MATRIX Part B.
+- [ ] **Step 2:** Add `npm run criteria -- --check --matrix` to `verify` (it is already in CI; confirm it now passes).
+- [ ] **Step 3:** `npm run verify` → all green; paste the counts in the PR.
+- [ ] **Step 4: Commit** `Every criterion tagged; verify green`
+
+### Task 12.3: Handoff and the Supabase prompt, final
+
+**Files:** Modify `HANDOFF.md` (§4 Resend domain, §5 WhatsApp templates and test number, §6 Vercel env list from `.env.example`, §7 the first demo script for Mike: who calls, what they say, what the broker sees, how long it takes, what it cost), regenerate `docs/SUPABASE-PROMPT.md`, update `README.md` status, `docs/VERIFIED.md` complete.
+
+- [ ] **Step 1:** Write. **Step 2:** The orchestrator walks the demo script against the e2e fixtures. **Step 3: Commit** `Handoff: the demo, step by step`
+
+### Task 12.4: Drift audit and the PR
+
+- [ ] **Step 1:** Phase reviewer agent reads the branch against BEHAVIOR-MATRIX Part A, SPEC §0, Part B; lists drift; orchestrator fixes.
+- [ ] **Step 2:** Open the PR against `main` with: what changed, the verify counts (tests, criteria tagged, grep results, print smoke), the founder's steps (keys to set, accounts to create, what costs money and is waiting for a yes), one tester prompt covering call-in, in-person and the dashboard.
+- [ ] **Step 3:** Reply briefly in chat (BEHAVIOR-MATRIX A19).
+
+---
+
+## Self-review notes (written with the spec open)
+
+- **Spec coverage:** SPEC §3.1 steps 1–10 → Tasks 3.1–3.4, 4.2, 5.x, 6.x, 7.x, 8.3; §3.2 → Phase 10; §3.3 → 2.4, 3.2, 5.1, 7.5; §3.4 → 3.4, 7.5; §4 → 1.1; §5 → 9.1; §6 → 4.3, 4.4; §7.1–7.9 → 3.4, 2.2, 2.3/4.2, 5.1, 2.4, 5.3, 6.1, 6.2, 7.5; §8 → 5.x; §9 → 6.3, 6.4, 8.4; §10 → Phase 8; §11 → 7.1–7.4; §12 → Phase 11, 7.6; §13 → 0.2, 0.5, 1.1, 7.4, 8.1; §14 → 0.1, 4.1, 12.1, 12.2; §15 nothing to build.
+- **Type consistency:** `Fact`/`FactDraft` (Task 2.3) are what `needsFrom` (5.1), `selectProduct` (5.3), `allowedNumbers` (6.1), `checkQuoteText` (6.2), `quoteDocHTML` (6.3), `roaHTML` (6.5) consume; `Selection` (5.3) is what `runMatch` writes and `versions.ts` (8.4) re-creates; `approveQuote`/`transition` (7.3) are the only writers of `quotes.status` besides `checkQuote` via `advanceAfterCheck` (6.2 stub → 7.3 real).
+- **Review Focus tests** are assigned: 1 → 2.1, 2 → 3.5, 3 → 2.3, 4 → 8.3, 5 → 7.3.
+- **Proportion:** the plan names files, signatures, criteria ranges and commit messages, and leaves bodies to the executor; the criteria files carry the assertions so the plan does not repeat them.

@@ -1,0 +1,31 @@
+# Call — CI. Vercel does not typecheck at deploy; this is the only check.
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Every criterion tagged, every tag real
+        run: npm run criteria -- --check --matrix
+      # Vercel leaves import specifiers untouched: "./db.ts" deploys as an
+      # import of a file that does not exist. Every relative import ends in .js.
+      - name: Relative imports must end in .js
+        run: |
+          offenders="$(grep -rnHP --include='*.ts' \
+            "(?:\bfrom|\bimport|\brequire)\s*\(?\s*(['\"])\.{1,2}/[^'\"]*(?<!\.js)\1" \
+            api/ | grep -vP '^[^:]+:[0-9]+:\s*(//|\*|/\*)' || true)"
+          if [ -n "$offenders" ]; then echo "$offenders"; exit 1; fi
+      - run: npm run grep-models
+      - run: npm run grep-doc-css
+      - name: Print-to-PDF smoke
+        run: npm run preview-quote -- --smoke

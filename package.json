@@ -1,0 +1,29 @@
+{
+  "name": "call",
+  "private": true,
+  "type": "module",
+  "description": "A phone number that runs a fact-find with a client, reads it back, and hands the broker a matched, drafted quotation to approve and send. Everything recorded, sourced and costed.",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "TRACKING_OFF=1 node --experimental-strip-types --import ./scripts/register-ts.mjs --test \"test/**/*.test.ts\"",
+    "criteria": "node --experimental-strip-types --import ./scripts/register-ts.mjs scripts/criteria.ts",
+    "grep-models": "bash scripts/grep-models.sh",
+    "grep-doc-css": "bash scripts/grep-doc-css.sh",
+    "preview-quote": "node --experimental-strip-types --import ./scripts/register-ts.mjs scripts/preview-quote.mjs",
+    "push-agent": "node --experimental-strip-types --import ./scripts/register-ts.mjs scripts/push-agent.ts",
+    "verify": "npm run typecheck && npm test && npm run criteria -- --check && npm run grep-models && npm run grep-doc-css && npm run preview-quote -- --smoke"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "147.0.0",
+    "@supabase/supabase-js": "^2.45.4",
+    "@vercel/functions": "^3.9.8",
+    "puppeteer-core": "^24.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "typescript": "^5.6.2"
+  }
+}
