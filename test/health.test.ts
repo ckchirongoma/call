@@ -39,6 +39,24 @@ const SHA_BEFORE = process.env.VERCEL_GIT_COMMIT_SHA;
 
 let fake: FakeDb | null = null;
 
+/**
+ * A Supabase client stand-in that records every call made on it, in order,
+ * with its arguments, and answers one row when the chain is awaited.
+ */
+function recordingClient(): { client: unknown; chain: string[] } {
+  const chain: string[] = [];
+  const link: unknown = new Proxy(() => {}, {
+    get(_target, prop) {
+      if (prop === "then") return (resolve: (v: unknown) => void) => resolve({ data: [{ role: "extract" }], error: null });
+      return (...args: unknown[]) => {
+        chain.push(`${String(prop)}(${args.map((a) => JSON.stringify(a)).join(", ")})`);
+        return link;
+      };
+    },
+  });
+  return { client: link, chain };
+}
+
 afterEach(async () => {
   fake?.uninstall();
   fake = null;
@@ -104,6 +122,17 @@ describe("GET /api/health", () => {
     assert.equal(fake.log[0]!.op, "select");
     assert.equal(fake.log[0]!.table, "model_config");
     assert.deepEqual(fake.log[0]!.filters, [], "no filter: nothing for the database to search");
+
+    // Cheap is one column of one row, no filter and no order. The fake does not
+    // log columns or limits, so a client that records every call says it.
+    const { client, chain } = recordingClient();
+    const recording = __setClient(client as never);
+    try {
+      assert.deepEqual((await get("/api/health?ping=1")).body, { ok: true });
+    } finally {
+      recording();
+    }
+    assert.deepEqual(chain, ['from("model_config")', 'select("role")', "limit(1)"]);
 
     // The keep-alive cron (Task 11.1) reads this answer, so a failed query is a failure, not a quiet 200.
     const restore = __setClient({

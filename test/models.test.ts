@@ -36,7 +36,7 @@ import {
   transcribeAudio,
 } from "../api/_lib/models.ts";
 import { jobCtx } from "../api/_lib/jobctx.ts";
-import { flushTracking } from "../api/_lib/track.ts";
+import { errorText, flushTracking, holdForFlush, trackFailure, tracked } from "../api/_lib/track.ts";
 
 const A = "test/model-a";
 const B = "test/model-b";
@@ -198,6 +198,20 @@ describe("models: truncation is a size problem", () => {
     );
   });
 
+  test("[C-1500] an object that opens and never closes is cut off whatever finish_reason says: more room on the same model, not a JSON-only retry", async () => {
+    say(A, modelReply('{"need": "funeral", "people": ', { finishReason: "stop" }), { need: "funeral", people: 4 });
+    const out = await askJSON("extract", PROMPT);
+    assert.deepEqual(out.value, { need: "funeral", people: 4 });
+    assert.deepEqual(models(), [A, A]);
+    assert.deepEqual(budgets(), [1200, 2400]);
+    assert.doesNotMatch(net.modelCalls[1]!.prompt, /Return JSON only/, "a size problem, not a format problem");
+
+    // A list cut off part-way under the same misreported "stop" is a size problem too.
+    say(A, modelReply('[{"f": "age 42"}, {"f": ', { finishReason: "stop" }), { facts: [{ f: "age 42" }, { f: "smoker" }] });
+    assert.deepEqual((await askJSON("extract", PROMPT)).value, { facts: [{ f: "age 42" }, { f: "smoker" }] });
+    assert.deepEqual(budgets().slice(-2), [1200, 2400]);
+  });
+
   test("[C-1505] a deadline nearer than the retry needs throws DeadlineError before the retry is sent, and it reaches the job unchanged", async () => {
     // Inside a job attempt: 40 s left, the first call takes 20 s and comes back cut off.
     say(A, () => {
@@ -283,6 +297,33 @@ describe("models: a different model, not a wait", () => {
     assert.deepEqual((await askJSON("extract", PROMPT)).value, { a: 2 });
   });
 
+  test("[C-1509] a bug in our own request code keeps its words and goes to no other model; a provider's unreadable answer still moves on", async (t) => {
+    const logged = t.mock.method(console, "log", () => {});
+    // A value JSON cannot carry, in the request we build: our bug, before anything is sent.
+    const cfg = await loadModelConfig("extract");
+    cfg.params.reasoning = { budget: 10n };
+    try {
+      await assert.rejects(askJSON("extract", PROMPT), (e: unknown) => e instanceof TypeError && /BigInt/.test(e.message));
+    } finally {
+      delete cfg.params.reasoning;
+    }
+    assert.equal(net.modelCalls.length, 0, "nothing sent, and no fallback asked to hide it");
+    assert.ok(
+      logged.mock.calls.some((c) => /model bug \[extract\].*BigInt/.test(c.arguments.join(" "))),
+      "the log line says what went wrong",
+    );
+    await flushTracking();
+    const [incident] = incidents("model_call_failed");
+    assert.ok(incident, "the failure is on the record");
+    assert.match(String(incident.summary), /BigInt/, "with its words, not relabelled network");
+
+    // HTTP 200 whose body is not an object: the provider failed, and another model may not.
+    say(A, new Response("null", { status: 200, headers: { "Content-Type": "application/json" } }));
+    say(B, { a: 3 });
+    assert.deepEqual((await askJSON("extract", PROMPT)).value, { a: 3 });
+    assert.deepEqual(models(), [A, B]);
+  });
+
   test("[C-1510] when the row's own model and every configured fallback fail, HARD_FALLBACKS are tried in order", async () => {
     say(A, status(429));
     say(B, status(503));
@@ -297,6 +338,54 @@ describe("models: a different model, not a wait", () => {
     otherwise = () => status(503);
     await assert.rejects(askJSON("extract", PROMPT), ModelUnavailable);
     assert.deepEqual(models(), [A, HARD_FALLBACKS[0], B, ...HARD_FALLBACKS.slice(1)]);
+  });
+
+  test("[C-1510] a 402 from a paid model skips the paid models left and runs on the :free last resorts, with no credit incident when one answers", async () => {
+    // The free stack on a congested day: the row's model and its fallbacks are
+    // rate-limited, the first last resort is paid, and the account has no credit.
+    assert.doesNotMatch(HARD_FALLBACKS[0]!, /:free$/);
+    assert.match(HARD_FALLBACKS[1]!, /:free$/);
+    say(A, status(429));
+    say(B, status(429));
+    say(C, status(429));
+    say(HARD_FALLBACKS[0]!, status(402, '{"error":{"message":"Insufficient credits"}}'));
+    say(HARD_FALLBACKS[1]!, { a: 1 });
+    const out = await askJSON("extract", PROMPT, { sessionId: SESSION });
+    assert.deepEqual(out.value, { a: 1 });
+    assert.equal(out.model, HARD_FALLBACKS[1]);
+    assert.deepEqual(models(), [A, B, C, HARD_FALLBACKS[0], HARD_FALLBACKS[1]]);
+    await flushTracking();
+    assert.equal(incidents("openrouter_credit").length, 0, "a free model answered: nobody needs paging");
+    assert.equal(fake.tables.safety_events.at(-1)!.detail.reason, "credit");
+
+    // A 402 from the row's own paid model: B, C and the paid last resort would
+    // be refused the same way, so they are not sent; the free ones are.
+    say(A, status(402));
+    say(HARD_FALLBACKS[1]!, { a: 2 });
+    net.modelCalls.length = 0;
+    assert.deepEqual((await askJSON("extract", PROMPT)).value, { a: 2 });
+    assert.deepEqual(models(), [A, HARD_FALLBACKS[1]]);
+  });
+
+  test("[C-1510] after a 402, when no free model answers either, the critical openrouter_credit incident is raised; a 402 on a :free model stops the chain", async () => {
+    say(A, status(402));
+    otherwise = () => status(503);
+    await assert.rejects(askJSON("extract", PROMPT), (e: unknown) => e instanceof ModelUnavailable && e.kind === "credit");
+    assert.deepEqual(models(), [A, ...HARD_FALLBACKS.filter((m) => m.endsWith(":free"))]);
+    await flushTracking();
+    const [incident, ...rest] = incidents("openrouter_credit");
+    assert.equal(rest.length, 0);
+    assert.equal(incident!.severity, "critical");
+    assert.equal(incident!.count, 1);
+
+    // A 402 for a :free model means the balance is below zero: every model on the account is refused.
+    const FREE = "test/model-a:free";
+    await reseed([configRow({ model: FREE })]);
+    say(FREE, status(402));
+    await assert.rejects(askJSON("extract", PROMPT), (e: unknown) => e instanceof ModelUnavailable && e.kind === "credit");
+    assert.deepEqual(models(), [FREE]);
+    await flushTracking();
+    assert.equal(incidents("openrouter_credit").length, 1);
   });
 
   test("[C-1511] when every model fails, ModelUnavailable is thrown out of the job, so the queue retries it", async () => {
@@ -397,6 +486,30 @@ describe("models: JSON that arrives untidy", () => {
     assert.equal(extractJSON('{"never": "closed"'), null);
   });
 
+  test("[C-1517] a top-level list is rejected, as Charlie's extractJSON did, never cut down to its first object", async () => {
+    assert.equal(extractJSON('[{"fact": "age 42"}, {"fact": "smoker"}]'), null);
+    assert.equal(extractJSON('```json\n[{"fact": "age 42"}, {"fact": "smoker"}]\n```'), null);
+    assert.equal(extractJSON('Here are the facts: [{"fact": "age 42"}, {"fact": "smoker"}]'), null);
+    // A bracket in the prose that closes before the object is prose.
+    assert.deepEqual(extractJSON('See note [1]: {"a": 1}'), { a: 1 });
+    // An object that holds lists is what the layer is for.
+    assert.deepEqual(extractJSON('{"facts": [{"f": 1}, {"f": 2}]}'), { facts: [{ f: 1 }, { f: 2 }] });
+
+    // Through askJSON: unreadable, so the JSON-only retry, then the step fails. Never half the facts.
+    const list = '[{"fact": "age 42"}, {"fact": "smoker"}]';
+    say(A, list, list);
+    await assert.rejects(askJSON("extract", PROMPT), (e: unknown) => e instanceof ModelUnavailable && e.kind === "bad_output");
+    assert.deepEqual(models(), [A, A]);
+    assert.ok(net.modelCalls[1]!.prompt.endsWith(JSON_ONLY));
+  });
+
+  test("[C-1515] only a fence that opens or closes the reply is removed: a fence inside a quoted string is left as the client said it", () => {
+    assert.deepEqual(extractJSON('{"quote": "he typed ```js here"}'), { quote: "he typed ```js here" });
+    assert.deepEqual(extractJSON('```json\n{"quote": "a ``` b"}\n```'), { quote: "a ``` b" });
+    assert.deepEqual(extractJSON('```\n{"a": 1}\n```'), { a: 1 });
+    assert.deepEqual(extractJSON('Sure:\n```json\n{"a": 1}\n```\nAnything else?'), { a: 1 });
+  });
+
   test(`[C-1518] unrepairable output gets one retry with "Return JSON only" appended, then fails without a fallback`, async () => {
     say(A, "I'm sorry, I can't produce that.", "Still not JSON.");
     await assert.rejects(askJSON("extract", PROMPT), (e: unknown) => e instanceof ModelUnavailable && e.kind === "bad_output");
@@ -421,6 +534,37 @@ describe("models: JSON that arrives untidy", () => {
     const [withMode, without] = net.modelCalls;
     assert.deepEqual(withMode!.payload.response_format, { type: "json_object" });
     assert.equal("response_format" in without!.payload, false);
+  });
+
+  test("[C-1519][C-1512] a 400 that names response_format is retried once on the same model without it; any other 400 is still our bug", async () => {
+    await reseed([configRow({ params: { json_mode: true } })]);
+    const refused = () => status(400, '{"error":{"message":"response_format json_object is not supported by this model"}}');
+    const rf = (i: number) => net.modelCalls[i]!.payload.response_format;
+    say(A, refused(), { a: 1 });
+    const out = await askJSON("extract", PROMPT);
+    assert.deepEqual(out.value, { a: 1 });
+    assert.equal(out.model, A);
+    assert.deepEqual(models(), [A, A], "the same model again, not a fallback");
+    assert.deepEqual(rf(0), { type: "json_object" });
+    assert.equal(rf(1), undefined);
+
+    // Dropped for that model only: the next one in the chain is asked with it again.
+    net.modelCalls.length = 0;
+    say(A, refused(), status(503));
+    say(B, { a: 2 });
+    assert.deepEqual((await askJSON("extract", PROMPT)).value, { a: 2 });
+    assert.deepEqual(models(), [A, A, B]);
+    assert.deepEqual([rf(0), rf(1), rf(2)], [{ type: "json_object" }, undefined, { type: "json_object" }]);
+
+    // Once only, and only for a 400 about response_format.
+    net.modelCalls.length = 0;
+    say(A, refused(), refused());
+    await assert.rejects(askJSON("extract", PROMPT), ModelBadRequest);
+    assert.deepEqual(models(), [A, A]);
+    net.modelCalls.length = 0;
+    say(A, status(400, '{"error":{"message":"messages[0].content must be a string"}}'));
+    await assert.rejects(askJSON("extract", PROMPT), ModelBadRequest);
+    assert.deepEqual(models(), [A]);
   });
 
   test("[C-1520] a reply the schema rejects (a required key missing) is unrepairable: one retry, then failure", async () => {
@@ -525,6 +669,50 @@ describe("models: model_config decides, never code", () => {
     await askJSON("extract", PROMPT);
     assert.equal(models().at(-1), B, "60 s after the read, the UPDATE is live");
     assert.equal(reads(), 2);
+  });
+});
+
+describe("models: what reaches the record (track.ts, as the model layer uses it)", () => {
+  beforeEach(() => setup());
+  afterEach(teardown);
+
+  test("[C-1512] a provider's 400 body is surfaced in the error and nowhere else: not in errorText, a failed job's incident, or a crashed request's", async () => {
+    // A provider's error can echo the request, and in Call the request is a client's health and money.
+    const ECHO = "the client said her daughter Thandi has epilepsy";
+    say(A, status(400, JSON.stringify({ error: { message: `invalid content: ${ECHO}` } })));
+    const err = await askJSON("extract", PROMPT).catch((e: unknown) => e);
+    assert.ok(err instanceof ModelBadRequest);
+    assert.match(err.message, /Thandi/, "the caller still sees the provider's words (C-1512)");
+
+    assert.equal(errorText(err), `ModelBadRequest: 400 (${A}) for extract`);
+    // The queue's failed-job incident and last_error (Task 0.4) go through errorText, as does any trackFailure.
+    trackFailure("job_failed", err);
+    const crash = tracked("worker", "system", async () => {
+      throw err;
+    });
+    await assert.rejects(crash(new Request("https://call.test/api/worker")), ModelBadRequest);
+    await flushTracking();
+    assert.ok(incidents("job_failed")[0], "the failed job is on the record");
+    assert.ok(incidents("request_crashed")[0], "so is the crashed request");
+    assert.doesNotMatch(JSON.stringify(fake.tables.incidents), /Thandi|epilepsy|invalid content/);
+  });
+
+  // No criterion of its own: what keeps a failed held write (intel.ts registers
+  // its flusher's promise here from Task 0.6) from crashing the process.
+  test("a held write that rejects is never an unhandled rejection, and the flush still finishes", async () => {
+    const seen: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      seen.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      holdForFlush(Promise.reject(new Error("held write failed")));
+      await flushTracking();
+      await new Promise((r) => setImmediate(r));
+      assert.deepEqual(seen, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 });
 

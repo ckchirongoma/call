@@ -128,9 +128,14 @@ export function errorText(err: unknown): string {
   let raw: string;
   try {
     // A model provider's error body can echo the request (the client's words):
-    // only its status and kind are kept (models.ts ModelError).
+    // only its status and kind are kept (models.ts ModelError). A
+    // ModelBadRequest carries that body in its message on purpose, for the
+    // caller (C-1512); the record gets the status, model and role, never the body.
     if (err instanceof Error && err.name === "ModelError") raw = `ModelError: ${(err as { status?: unknown }).status ?? ""} ${(err as { kind?: unknown }).kind ?? ""} ${err.message.split(":")[0]}`.trim();
-    else if (err instanceof Error) raw = `${err.name === "Error" ? "" : `${err.name}: `}${err.message}`;
+    else if (err instanceof Error && err.name === "ModelBadRequest") {
+      const e = err as { status?: unknown; model?: unknown; role?: unknown };
+      raw = `ModelBadRequest: ${e.status ?? ""} (${e.model ?? ""}) for ${e.role ?? ""}`;
+    } else if (err instanceof Error) raw = `${err.name === "Error" ? "" : `${err.name}: `}${err.message}`;
     else if (typeof err === "string") raw = err;
     else if (err && typeof err === "object") {
       // A Supabase/PostgREST error is a plain object whose `details` and
@@ -151,10 +156,18 @@ const inflight = new Set<Promise<unknown>>();
 /** One "tracking is down" console line per process, not one per event. */
 let warnedDown = false;
 
-/** For a write that must not hold up the caller: flushTracking() waits for it. */
+/**
+ * For a write that must not hold up the caller: flushTracking() waits for it.
+ * then(del, del), not finally(del): the promise finally() returns rejects when
+ * `p` does, and nothing would catch it — an unhandled rejection, which ends a
+ * Node process by default.
+ */
 export function holdForFlush(p: Promise<unknown>): void {
   inflight.add(p);
-  void p.finally(() => inflight.delete(p));
+  const del = (): void => {
+    inflight.delete(p);
+  };
+  void p.then(del, del);
 }
 
 /**
