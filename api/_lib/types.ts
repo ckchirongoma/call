@@ -473,6 +473,13 @@ export interface Incident {
   first_at: string;
   last_at: string;
   count: number;
+  /**
+   * How loudly to tell a human (Task 0.4 fix round, as Charlie's `alert`):
+   * set from the caller's hint (track.ts), by severity when there is none;
+   * a repeat keeps the loudest it has had. alerts.ts emails `immediate` at
+   * once, puts `digest` in the daily digest, and never emails `none`.
+   */
+  alert_level: "immediate" | "digest" | "none";
   created_at: string;
 }
 

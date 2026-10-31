@@ -36,8 +36,10 @@
 //     union of keys, and PostgREST writes NULL, not the default, into the gaps.
 //
 // Not emulated: foreign keys and cascades (forgetClient deletes explicitly),
-// RLS (db/0007 and test/rls.test.ts own that), column types and NOT NULL /
-// CHECK constraints, joins.
+// with one exception, jobs.session_id ON DELETE CASCADE (deleting a session
+// deletes its jobs: the queue's correctness rests on it, so the fake and
+// Postgres must agree); RLS (db/0007 and test/rls.test.ts own that), column
+// types and NOT NULL / CHECK constraints, joins.
 //
 // Several tasks extend this file (0.3 finish_reason, 0.6 the intel_events
 // missing-table switch); add the shape you need and keep the throw. Task 0.3
@@ -45,7 +47,10 @@
 // bump_incident rpc (track.ts counts incidents through it), and failTable() (a
 // table that answers every query with an error: "model_config is unreadable").
 // Task 0.4 gave claim_job Call's semantics: a 120-second lock timeout, and no
-// job handed out ahead of an unfinished earlier job of its own session.
+// job handed out ahead of an unfinished earlier job of its own session. Its
+// fix round: forget_client first and never held by its session; the jobs
+// cascade; bump_incident's p_alert_level; and an rpc answers the failTable()
+// error of the table it reads (claim_job: jobs, bump_incident: incidents).
 
 // Must be first: api/_lib/env.ts snapshots process.env when it is first imported,
 // and importing the fakes imports api/_lib/db.ts which imports it.
@@ -153,7 +158,7 @@ const COLUMNS = {
   safety_events: ["id", "session_id", "check", "engine", "outcome", "detail", "created_at"],
   usage_ledger: ["id", "session_id", "item", "qty", "unit", "cost_cents", "provider_ref", "created_at"],
   audit_log: ["id", "broker_user_id", "action", "entity", "entity_id", "before", "after", "at", "created_at"],
-  incidents: ["id", "kind", "severity", "summary", "fingerprint", "first_at", "last_at", "count", "created_at"],
+  incidents: ["id", "kind", "severity", "summary", "fingerprint", "first_at", "last_at", "count", "alert_level", "created_at"],
   // INTEL-CONTRACT §1 exactly: its timestamp is `at`, and there is no created_at.
   intel_events: [
     "id", "at", "seq", "app", "v", "trace_id", "turn_id", "job_id", "business_id", "channel", "stage", "kind", "name", "actor", "ok", "ms", "content_mode",
@@ -246,7 +251,7 @@ const DEFAULTS: { readonly [T in TableName]?: () => Partial<TableRows[T]> } = {
   audit_log: () => ({ at: new Date().toISOString() }),
   incidents: () => {
     const now = new Date().toISOString();
-    return { first_at: now, last_at: now, count: 1 };
+    return { first_at: now, last_at: now, count: 1, alert_level: "digest" };
   },
   intel_events: () => ({ at: new Date().toISOString(), seq: 0, v: 1, content_mode: "full" }),
 };
@@ -797,6 +802,13 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
       }
       // In place, so a test's reference to fake.tables.x stays valid.
       for (const row of hit) tables[t].splice(tables[t].indexOf(row), 1);
+      // jobs.session_id REFERENCES sessions ON DELETE CASCADE (Task 0.4 fix
+      // round): a forgotten session's queued jobs go with it, and a running one
+      // loses its row, so its next fencing read (stillOwnJob) stops it.
+      if (t === "sessions") {
+        const gone = new Set(hit.map((r) => r.id));
+        for (let i = tables.jobs.length - 1; i >= 0; i--) if (gone.has(tables.jobs[i]!.session_id)) tables.jobs.splice(i, 1);
+      }
       return done(returning ? hit.map(project) : null);
     };
 
@@ -940,6 +952,12 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
    * the order they were queued, however many workers claim at once; a job
    * with no session waits for nothing. As in SQL, a comparison with NULL is
    * not true: a NULL run_after is never due, a NULL locked_at never stale.
+   *
+   * forget_client is the exception, both ways (Task 0.4 fix round): it never
+   * waits behind its session's earlier jobs, and a runnable one is claimed
+   * before anything else. A client who asked to be forgotten must not wait
+   * behind a send_quote deferred to tomorrow (C-1067) — that send is the
+   * quotation a forgotten client must never receive (C-1412).
    */
   const claimJob = (args: Record<string, unknown>): Row[] => {
     const now = Date.now();
@@ -952,10 +970,14 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
       const at = ms(j.locked_at);
       return at !== null && now - at > STALE_LOCK_MS;
     };
+    const first = (j: Row): boolean => j.kind === "forget_client";
     const behindItsSession = (j: Row): boolean =>
-      !isNil(j.session_id) && tables.jobs.some((o) => o.session_id === j.session_id && o.id < j.id && (o.status === "queued" || o.status === "running"));
+      !first(j) && !isNil(j.session_id) && tables.jobs.some((o) => o.session_id === j.session_id && o.id < j.id && (o.status === "queued" || o.status === "running"));
     const runnable = tables.jobs.filter((j) => ((j.status === "queued" && due(j)) || (j.status === "running" && stale(j))) && !behindItsSession(j));
-    runnable.sort((a, b) => (ms(a.run_after) ?? Infinity) - (ms(b.run_after) ?? Infinity) || (order.get(a) ?? 0) - (order.get(b) ?? 0));
+    runnable.sort(
+      (a, b) =>
+        Number(first(b)) - Number(first(a)) || (ms(a.run_after) ?? Infinity) - (ms(b.run_after) ?? Infinity) || (order.get(a) ?? 0) - (order.get(b) ?? 0),
+    );
     const job = runnable[0];
     if (!job) return [];
     job.status = "running";
@@ -966,20 +988,29 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
   };
 
   const SEVERITIES = ["info", "warn", "error", "critical"];
+  /** Quietest first: a repeat keeps the loudest level the incident has had. */
+  const ALERT_LEVELS = ["none", "digest", "immediate"];
 
   /**
-   * bump_incident(p_fingerprint, p_kind, p_severity, p_summary): one atomic
-   * upsert-and-count per distinct problem, as Charlie's db/0024, on Call's
-   * incidents columns. A new fingerprint is a row with count 1; a repeat adds
-   * one, moves last_at, keeps the worst severity it has ever had (one critical
-   * repeat is never downgraded) and the latest summary. The summary is cut to
-   * 500 characters, as the SQL's left(p_summary, 500). Returns void (data null).
-   * Task 0.4 / 1.1 own the real function and update this when it differs.
+   * bump_incident(p_fingerprint, p_kind, p_severity, p_summary, p_alert_level):
+   * one atomic upsert-and-count per distinct problem, as Charlie's db/0024, on
+   * Call's incidents columns. A new fingerprint is a row with count 1 and the
+   * caller's alert level; a repeat adds one, moves last_at, keeps the worst
+   * severity and the loudest alert level it has ever had (one critical or
+   * immediate repeat is never quietened) and the latest summary. Charlie's
+   * db/0025 let an emailed incident come down again; that needs its
+   * since_email counter, which Call's incidents do not have. The summary is cut
+   * to 500 characters, as the SQL's left(p_summary, 500). Returns void (data
+   * null). Task 1.1's follow-up writes the SQL to match (plan notes, Task 0.4).
    */
   const bumpIncident = (args: Record<string, unknown>): Result => {
     const severity = String(args.p_severity);
     if (!SEVERITIES.includes(severity)) {
       return fail(pgError("23514", `new row for relation "incidents" violates check constraint "incidents_severity_check"`), 400);
+    }
+    const level = String(args.p_alert_level);
+    if (!ALERT_LEVELS.includes(level)) {
+      return fail(pgError("23514", `new row for relation "incidents" violates check constraint "incidents_alert_level_check"`), 400);
     }
     const summary = String(args.p_summary).slice(0, 500);
     const now = new Date().toISOString();
@@ -988,17 +1019,27 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
       existing.count = (existing.count ?? 0) + 1;
       existing.last_at = now;
       if (SEVERITIES.indexOf(severity) > SEVERITIES.indexOf(existing.severity)) existing.severity = severity;
+      if (ALERT_LEVELS.indexOf(level) > ALERT_LEVELS.indexOf(existing.alert_level)) existing.alert_level = level;
       existing.summary = summary;
       return ok(null);
     }
-    const res = insertRows("incidents", [{ kind: args.p_kind, severity, summary, fingerprint: args.p_fingerprint, first_at: now, last_at: now, count: 1 }], true);
+    const res = insertRows(
+      "incidents",
+      [{ kind: args.p_kind, severity, summary, fingerprint: args.p_fingerprint, first_at: now, last_at: now, count: 1, alert_level: level }],
+      true,
+    );
     return "error" in res ? fail(res.error, res.status) : ok(null);
   };
 
-  /** Each faked function, with its exact parameter list (PostgREST answers PGRST202 for any other) and whether every one is text. */
-  const RPCS: Record<string, { params: string[]; text: boolean; run: (args: Record<string, unknown>) => Result | Row[] }> = {
-    claim_job: { params: ["p_worker"], text: false, run: claimJob },
-    bump_incident: { params: ["p_fingerprint", "p_kind", "p_severity", "p_summary"], text: true, run: bumpIncident },
+  /**
+   * Each faked function, with its exact parameter list (PostgREST answers
+   * PGRST202 for any other), whether every one is text, and the table it
+   * reads: a function over a table that failTable() has broken fails too, as
+   * it would in Postgres (claim_job on a jobs table it cannot read).
+   */
+  const RPCS: Record<string, { params: string[]; text: boolean; reads: TableName; run: (args: Record<string, unknown>) => Result | Row[] }> = {
+    claim_job: { params: ["p_worker"], text: false, reads: "jobs", run: claimJob },
+    bump_incident: { params: ["p_fingerprint", "p_kind", "p_severity", "p_summary", "p_alert_level"], text: true, reads: "incidents", run: bumpIncident },
   };
 
   /** A builder, like supabase-js's: nothing runs until it is awaited, and single()/maybeSingle() shape the rows. */
@@ -1027,6 +1068,8 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
       then(resolve: (v: unknown) => unknown, reject?: (e: unknown) => unknown) {
         try {
           log.push({ table: "", op: "rpc", filters: [], fn, args: wire(args) });
+          const broken = failing.get(def.reads);
+          if (broken) return Promise.resolve(fail(broken, broken.code === "42P01" ? 404 : 500)).then(resolve, reject);
           const out = def.run(args);
           return Promise.resolve(Array.isArray(out) ? finish(out, null, mode) : out).then(resolve, reject);
         } catch (err) {

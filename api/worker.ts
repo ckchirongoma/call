@@ -7,12 +7,17 @@
 // runner (?watch=1) is not ported: claim_job's 120-second lock timeout does
 // its job (queue.ts).
 //
-//   POST|GET /api/worker            drain now, answer the DrainReport
+//   POST|GET /api/worker            drain now, answer the DrainReport (what it could do now: no waiting)
 //   POST     /api/worker?async=1    a kick or a hand-on: 202 at once, drain in this invocation's own budget
-//   GET      /api/worker?tick=1     the daily cron (vercel.json, Task 11.1): drain, the catch-up sweep
+//   GET      /api/worker?tick=1     the daily cron (vercel.json, Task 11.1): drain, the catch-up sweep, the digest
 //
-// Every form ends with the alert pass (alerts.ts): Call's cron runs once a
-// day, so the drain that fails a job is what emails about it.
+// Every form starts by raising queued work nothing woke for (job_overdue) and
+// ends with the alert pass (alerts.ts): Call's cron runs once a day, so the
+// drain that fails a job is what emails about it, and the tick is what sends
+// the daily digest. The hand-on and the tick wait in-process for a retry that
+// falls due inside their budget (queue.ts waitForDue). When the queue's own
+// machinery failed (a claim, a settle, the hand-on), the answer is 500
+// {ok: false, errors}, so the failure is a request_failed too, not a 200.
 //
 // Authenticated with WORKER_SECRET (the self-calls, an operator) or Vercel's
 // CRON_SECRET (a schedule), as `Authorization: Bearer …`. It fails CLOSED:
@@ -28,7 +33,7 @@ import { timingSafeEqual } from "node:crypto";
 import { waitUntil } from "@vercel/functions";
 import { env } from "./_lib/env.js";
 import { runAlerts } from "./_lib/alerts.js";
-import { WORKER_BUDGET_MS, drain, hopFrom, withHop } from "./_lib/queue.js";
+import { WORKER_BUDGET_MS, drain, hopFrom, noteOverdueJobs, withHop, type DrainReport } from "./_lib/queue.js";
 import { errorText, noteRequestFailure, tracked } from "./_lib/track.js";
 
 export function authorised(req: Request): boolean {
@@ -70,24 +75,29 @@ async function handler(req: Request): Promise<Response> {
   return withHop(hopFrom(url), () => route(url, maxJobs));
 }
 
+/** One worker run: overdue work on the record first (before the drain takes it), the drain, then the alert pass. */
+async function run(label: "handon" | "tick" | "sweep", maxJobs: number): Promise<{ report: DrainReport; alerts: Awaited<ReturnType<typeof runAlerts>> }> {
+  await noteOverdueJobs();
+  const report = await drain({ maxJobs, budgetMs: WORKER_BUDGET_MS, label, waitForDue: label !== "sweep" });
+  const alerts = await runAlerts({ digest: label === "tick" });
+  return { report, alerts };
+}
+
 async function route(url: URL, maxJobs: number): Promise<Response> {
   // ?async=1 is a kick or a hand-on: answer at once so the caller can finish,
   // and do the work in this invocation's own time budget, waiting for work
-  // that becomes runnable within a minute (a retry's 10 s or 60 s backoff).
+  // that becomes runnable before it stops claiming (a retry's 10 s or 60 s
+  // backoff). Its failures are incidents already (queue.ts); nobody reads its answer.
   if (url.searchParams.get("async") === "1") {
-    afterResponse(
-      drain({ maxJobs, budgetMs: WORKER_BUDGET_MS, label: "handon", waitForDueMs: 60_000 })
-        .then(() => runAlerts())
-        .catch((err) => console.warn("hand-on drain failed", errorText(err))),
-    );
+    afterResponse(run("handon", maxJobs).catch((err) => console.warn("hand-on drain failed", errorText(err))));
     return json({ accepted: true }, 202);
   }
 
   const label = url.searchParams.get("tick") === "1" ? "tick" : "sweep";
   try {
-    const report = await drain({ maxJobs, budgetMs: WORKER_BUDGET_MS, label });
-    const alerts = await runAlerts();
-    return json(label === "tick" ? { ...report, alerts } : report, 200);
+    const { report, alerts } = await run(label, maxJobs);
+    if (!report.ok) noteRequestFailure(new Error(report.errors.join("; ")));
+    return json(label === "tick" ? { ...report, alerts } : report, report.ok ? 200 : 500);
   } catch (err) {
     console.log(`worker ${label} failed`, errorText(err));
     noteRequestFailure(err);

@@ -89,7 +89,7 @@ Owner: `test/post-call.test.ts` for the HTTP layer, `test/ingest.test.ts` for th
 | C-0482 | ingest | dropped | Given dropped, then the broker notification says "Call dropped at {mm:ss} — {n} facts unconfirmed". | test/journey.e2e.test.ts |
 | C-0483 | ingest | dropped | Given dropped with no channel, then the notification adds "No channel — call the client". | test/journey.e2e.test.ts |
 | C-0484 | ingest | dropped | Given dropped and the client calls back within 24 h, then init marks `known_client=yes` and the new session links `continues_session_id`. | test/voice-init.test.ts |
-| C-0485 | queue | retries | Given `extract_facts` throws, then the job's `attempts` increments and `run_after` is backoff (10 s, 60 s, 300 s). | test/queue.test.ts |
+| C-0485 | queue | retries | Given `extract_facts` throws, then the job's `attempts` increments and `run_after` is backoff (10 s, then 60 s; a third failure is final per C-0486). | test/queue.test.ts |
 | C-0486 | queue | retries | Given 3 failures, then `status=failed`, `last_error` set, incident `job_failed` with kind and session. | test/queue.test.ts |
 | C-0487 | queue | retries | Given a failed job, then `/admin` offers "retry" which resets attempts. | test/admin.test.ts |
 | C-0488 | queue | retries | Given `ingest_transcript` succeeded and `extract_facts` failed, then re-running `ingest_transcript` does not duplicate turns and `extract_facts` is re-enqueued once. | test/queue.test.ts |

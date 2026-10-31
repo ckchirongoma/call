@@ -173,9 +173,13 @@ export function holdForFlush(p: Promise<unknown>): void {
 /**
  * Counted in `incidents`, one row per fingerprint, by one atomic call
  * (bump_incident), so two workers reporting the same problem in the same
- * second add up instead of overwriting each other (Charlie db/0024).
+ * second add up instead of overwriting each other (Charlie db/0024). The row
+ * carries how loudly to tell a human (alert_level, Charlie's `alert`): what
+ * alerts.ts reads to decide between the immediate email, the daily digest and
+ * neither. Before Task 0.4's fix round it was dropped here and severity alone
+ * decided, so every transient model failure (error, "digest") was paged at once.
  */
-function bump(fingerprint: string, kind: string, severity: Severity, summary: string): void {
+function bump(fingerprint: string, kind: string, severity: Severity, summary: string, alert: AlertLevel): void {
   holdForFlush(
     (async () => {
       try {
@@ -184,6 +188,7 @@ function bump(fingerprint: string, kind: string, severity: Severity, summary: st
           p_kind: kind,
           p_severity: severity,
           p_summary: cutSafe(maskContacts(summary), 500),
+          p_alert_level: alert,
         });
         if (error) throw error;
       } catch (err) {
@@ -249,7 +254,7 @@ export function track(name: string, opts: TrackOptions = {}): void {
     const alert: AlertLevel = opts.alert ?? (RANK[severity] >= RANK.error ? "immediate" : "digest");
     // A warning nobody need hear about is not an incident; a failure always is.
     if (alert === "none" && category !== "failure") return;
-    bump((opts.fingerprint ?? name).slice(0, 200), name.slice(0, 80), severity, opts.summary ?? name.replace(/_/g, " "));
+    bump((opts.fingerprint ?? name).slice(0, 200), name.slice(0, 80), severity, opts.summary ?? name.replace(/_/g, " "), alert);
   } catch (err) {
     // Tracking must never be the reason a job fails.
     if (!warnedDown) {
@@ -277,8 +282,11 @@ export function trackFailure(name: string, err: unknown, opts: TrackOptions = {}
   });
 }
 
+/** flushTracking()'s bound: queue.ts counts it in the worker's tail after its hard stop. */
+export const FLUSH_TIMEOUT_MS = 4000;
+
 /** Wait for every write in flight (end of a job, a request, a cron). Bounded. */
-export async function flushTracking(timeoutMs = 4000): Promise<void> {
+export async function flushTracking(timeoutMs = FLUSH_TIMEOUT_MS): Promise<void> {
   for (const f of registry().flushers) {
     try {
       const p = f.flush();

@@ -32,14 +32,23 @@
 //     job behind an unfinished earlier job of its session, and the drain holds
 //     one whose session is busy anyway (otherJobRunningFor). Up to three
 //     sessions run side by side in one drain; a job with no session waits for
-//     nothing.
+//     nothing. forget_client is the exception: claim_job takes a runnable one
+//     before anything else and never holds it behind its session, and it
+//     carries no session_id at all (enqueue).
 //   - Three attempts, 10 s then 60 s apart, then `failed` and an incident
 //     (job_failed), which alerts.ts emails at once. A hold (JobHoldError), a
 //     busy session and the first out-of-time requeue (DeadlineError) do not
-//     spend an attempt.
+//     spend an attempt. A worker run waits in-process for a retry that falls
+//     due inside its budget (waitForDue), and a queued job left more than 10
+//     minutes past its time is an incident on the next run (job_overdue).
 //   - Nothing half-written. A step's next step is queued only once the step has
-//     returned (enqueueNext), and a job whose session was forgotten is skipped
-//     without running.
+//     returned (enqueueNext). A forgotten session's jobs are deleted with it
+//     (jobs.session_id ON DELETE CASCADE): a queued one is gone, a running one
+//     is fenced at its next write, and one that still names a gone session is
+//     skipped without running.
+//   - Nothing fails silently. A claim that fails, a job whose outcome cannot be
+//     written and a hand-on that cannot read the queue are incidents, and the
+//     drain's report says ok: false (the worker answers 500).
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
@@ -47,7 +56,7 @@ import { db } from "./db.js";
 import { env } from "./env.js";
 import { DeadlineError, JobFencedError, JobHoldError, jobCtx, type JobCtx } from "./jobctx.js";
 import type { Job } from "./types.js";
-import { cutSafe, errorText, flushTracking, since, track, trackFailure, trackingOff, withTrackContext } from "./track.js";
+import { cutSafe, errorText, flushTracking, since, track, trackFailure, trackingOff, withTrackContext, type TrackOptions } from "./track.js";
 
 // ── Kinds and handlers ───────────────────────────────────────────
 
@@ -75,8 +84,11 @@ export type JobRow = Job;
 export type JobHandler = (job: JobRow, ctx: JobCtx) => Promise<void>;
 
 /**
- * Kinds whose job may outlive its session: forgetting a client deletes the
+ * Kinds whose job must outlive its session: forgetting a client deletes the
  * session its request came from, and a retry of the forget must still run.
+ * jobs.session_id is ON DELETE CASCADE, so such a job never carries one
+ * (enqueue moves it into the payload), and it is never skipped for a gone
+ * session.
  */
 const RUNS_WITHOUT_SESSION: ReadonlySet<string> = new Set<JobKind>(["forget_client"]);
 
@@ -111,9 +123,10 @@ export const MAX_ATTEMPTS = 3;
 
 /**
  * The wait before the next attempt, by the attempt that just failed: 10 s,
- * 60 s, then 300 s for any later one (C-0485). With MAX_ATTEMPTS at 3 a job
- * fails on its third failure, so 300 s is the ceiling, not a step every job
- * reaches. Exact, with no jitter: Charlie's jitter (round 22) spread five
+ * then 60 s (C-0485). Three attempts is fixed (C-0486, C-1541, SPEC §12), so a
+ * job fails on its third failure and never waits the third step: 300 s serves
+ * a kind later allowed more attempts, and is the ceiling for any attempt past
+ * the table. Exact, with no jitter: Charlie's jitter (round 22) spread five
  * plan-build stages failing at once; Call runs at most three sessions per
  * drain, and the criteria pin the delays.
  */
@@ -145,14 +158,37 @@ export const HOLD_MS = 5_000;
 /** Sessions run side by side in one drain (C-1601). Each lane runs one job at a time. */
 export const PARALLEL_SESSIONS = 3;
 
-/** A drain stops claiming within this (C-0492); job attempts must be done by it plus the margin, inside Vercel's 300 s kill. */
+/**
+ * The worker's clock, end to end. Vercel kills the function at VERCEL_KILL_MS
+ * (vercel.json maxDuration). A drain stops claiming within WORKER_BUDGET_MS
+ * (C-0492), and job attempts must be finished by the hard stop, the budget plus
+ * HARD_STOP_MARGIN_MS (jobctx.ts deadlineAt). After the hard stop comes the
+ * tail, which must fit before the kill: the flush (track.ts FLUSH_TIMEOUT_MS),
+ * the hand-on (one read and at most two self-calls of SELF_CALL_TIMEOUT_MS)
+ * and the alert pass (alerts.ts ALERT_PASS_MAX_MS). At a 30 s margin with
+ * 15 s self-calls the tail could run past 300 s, killing the hand-on.
+ */
+export const VERCEL_KILL_MS = 300_000;
 export const WORKER_BUDGET_MS = 240_000;
-export const HARD_STOP_MARGIN_MS = 30_000;
+export const HARD_STOP_MARGIN_MS = 10_000;
+/** The woken worker answers 202 before it does any work, so 5 s is ample, and two of them fit the tail. */
+export const SELF_CALL_TIMEOUT_MS = 5_000;
 
 /** How far ahead a queued job still counts as "left for us to do". */
 const HAND_ON_WITHIN_MS = 60_000;
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** A queued job this far past its run_after was not woken for: nothing took it when it fell due. */
+export const OVERDUE_MS = 10 * 60_000;
+
+let pause = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+/** Tests only: the drain's in-process waits, on the fake clock. Returns the undo. */
+export function __setSleep(fn: (ms: number) => Promise<void>): () => void {
+  const was = pause;
+  pause = fn;
+  return () => {
+    pause = was;
+  };
+}
 
 // ── Enqueueing ───────────────────────────────────────────────────
 
@@ -162,16 +198,24 @@ export interface EnqueueOptions {
   dedupeKey?: string;
 }
 
-/** Queue a job; returns its id. */
+/**
+ * Queue a job; returns its id. A forget_client job is given no session_id,
+ * whatever the caller passed: jobs.session_id is ON DELETE CASCADE, so a forget
+ * job tied to a session it deletes would delete itself mid-forget (its next
+ * fencing read would stop it), and once that session is gone the insert would
+ * break the foreign key. The session it came from rides in its payload.
+ */
 export async function enqueue(kind: JobKind, sessionId: string | null, payload: object, opts: EnqueueOptions = {}): Promise<string> {
   requireKind(kind);
   const runAfter = (opts.runAfter ?? new Date()).toISOString();
+  const detached = RUNS_WITHOUT_SESSION.has(kind) && sessionId !== null;
+  const stored: object = detached ? { ...(payload as Record<string, unknown>), session_id: sessionId } : payload;
   const { data, error } = await db()
     .from("jobs")
     .insert({
       kind,
-      session_id: sessionId,
-      payload,
+      session_id: detached ? null : sessionId,
+      payload: stored,
       run_after: runAfter,
       // Written out rather than left to the column defaults: these decide
       // whether the job is ever picked up, which is too important to be
@@ -183,7 +227,7 @@ export async function enqueue(kind: JobKind, sessionId: string | null, payload: 
     .select("id")
     .single();
   if (!error) return String((data as { id: number }).id);
-  if (opts.dedupeKey && (error as { code?: string }).code === "23505") return sameWork(opts.dedupeKey, payload, runAfter);
+  if (opts.dedupeKey && (error as { code?: string }).code === "23505") return sameWork(opts.dedupeKey, stored, runAfter);
   throw new Error(`enqueue ${kind} failed: ${errorText(error)}`);
 }
 
@@ -260,7 +304,17 @@ export async function claimJob(worker: string): Promise<JobRow | null> {
  */
 export async function otherJobRunningFor(sessionId: string, exceptJobId: number): Promise<boolean> {
   const { data, error } = await db().from("jobs").select("id, locked_at").eq("session_id", sessionId).eq("status", "running");
-  if (error) return false;
+  if (error) {
+    // Unreadable is busy: the job is held a few seconds (no attempt spent)
+    // rather than run beside its session, and the read failure is on the record.
+    trackFailure("session_check_failed", error, {
+      severity: "warn",
+      alert: "digest",
+      fingerprint: "session_check_failed",
+      summary: "The queue could not check whether a session already had a job running; the job was held rather than run beside it",
+    });
+    return true;
+  }
   const fresh = Date.now() - LOCK_TIMEOUT_MS;
   return ((data as { id: number; locked_at: string | null }[] | null) ?? []).some((r) => r.id !== exceptJobId && Date.parse(r.locked_at ?? "") > fresh);
 }
@@ -282,9 +336,21 @@ export async function finishJob(id: number, status: "done" | "failed" | "skipped
   return ((data as unknown[] | null) ?? []).length > 0;
 }
 
-/** Heartbeat: a job that is still being worked on keeps its lock fresh, so it is never taken for abandoned (C-1599). */
-export async function touchJob(id: number, worker: string): Promise<void> {
-  await db().from("jobs").update({ locked_at: new Date().toISOString() }).eq("id", id).eq("locked_by", worker).eq("status", "running");
+/**
+ * Heartbeat: a job that is still being worked on keeps its lock fresh, so it
+ * is never taken for abandoned (C-1599). Returns whether the lock was still
+ * this attempt's to touch; throws when the write failed.
+ */
+export async function touchJob(id: number, worker: string): Promise<boolean> {
+  const { data, error } = await db()
+    .from("jobs")
+    .update({ locked_at: new Date().toISOString() })
+    .eq("id", id)
+    .eq("locked_by", worker)
+    .eq("status", "running")
+    .select("id");
+  if (error) throw new Error(`touchJob ${id} failed: ${errorText(error)}`);
+  return ((data as unknown[] | null) ?? []).length > 0;
 }
 
 /** The fencing check: is this job still running under this worker's claim? */
@@ -292,7 +358,10 @@ export async function stillOwnJob(id: number, worker: string): Promise<boolean> 
   const { data, error } = await db().from("jobs").select("status, locked_by").eq("id", id).maybeSingle();
   // On a read failure, carry on: the heartbeat is the main defence, this is
   // the second, and the send's own idempotency key (Resend) the third.
-  if (error || !data) return true;
+  if (error) return true;
+  // No row: the job was deleted with its session (jobs.session_id ON DELETE
+  // CASCADE, "forget me" mid-step), so there is nothing left for it to do.
+  if (!data) return false;
   const row = data as { status: string; locked_by: string | null };
   return row.status === "running" && row.locked_by === worker;
 }
@@ -303,10 +372,11 @@ export async function stillOwnJob(id: number, worker: string): Promise<boolean> 
  * Used when the job was not really tried: its session was busy, it is waiting
  * on other work (JobHoldError), or it ran out of time the first time
  * (DeadlineError). Counting those as failed attempts would let a busy session
- * exhaust MAX_ATTEMPTS on a job nothing was ever wrong with.
+ * exhaust MAX_ATTEMPTS on a job nothing was ever wrong with. Returns whether
+ * it was this attempt's to put back (see scheduleRetry).
  */
-export async function holdJob(id: number, attempts: number, reason: string, delayMs = HOLD_MS, worker?: string): Promise<void> {
-  let q = db()
+export async function holdJob(id: number, attempts: number, reason: string, delayMs: number, worker: string): Promise<boolean> {
+  const { data, error } = await db()
     .from("jobs")
     .update({
       status: "queued",
@@ -314,16 +384,22 @@ export async function holdJob(id: number, attempts: number, reason: string, dela
       run_after: new Date(Date.now() + Math.max(0, delayMs)).toISOString(),
       last_error: cutSafe(reason, 2000),
     })
-    .eq("id", id);
-  // Only the attempt that holds the job can put it back (see finishJob).
-  if (worker) q = q.eq("locked_by", worker);
-  const { error } = await q;
+    .eq("id", id)
+    // Only the attempt that holds the job can put it back (see finishJob).
+    .eq("locked_by", worker)
+    .eq("status", "running")
+    .select("id");
   if (error) throw new Error(`holdJob ${id} failed: ${errorText(error)}`);
+  return ((data as unknown[] | null) ?? []).length > 0;
 }
 
-/** Failed but retriable: back off rather than hammering (BACKOFF_SECONDS). */
-export async function scheduleRetry(id: number, attempts: number, lastError: string, worker: string): Promise<void> {
-  const { error } = await db()
+/**
+ * Failed but retriable: back off rather than hammering (BACKOFF_SECONDS).
+ * Returns whether it was this attempt's to retry: false when another worker
+ * reclaimed the job between the attempt's ownership check and this write.
+ */
+export async function scheduleRetry(id: number, attempts: number, lastError: string, worker: string): Promise<boolean> {
+  const { data, error } = await db()
     .from("jobs")
     .update({
       status: "queued",
@@ -331,8 +407,11 @@ export async function scheduleRetry(id: number, attempts: number, lastError: str
       last_error: cutSafe(lastError, 2000),
     })
     .eq("id", id)
-    .eq("locked_by", worker);
+    .eq("locked_by", worker)
+    .eq("status", "running")
+    .select("id");
   if (error) throw new Error(`scheduleRetry ${id} failed: ${errorText(error)}`);
+  return ((data as unknown[] | null) ?? []).length > 0;
 }
 
 /**
@@ -363,6 +442,61 @@ export async function queuedWorkDue(withinMs: number, now = Date.now()): Promise
   };
 }
 
+export interface OverdueReport {
+  /** Queued jobs more than OVERDUE_MS past their run_after. */
+  count: number;
+  oldest: { id: number; kind: string; minutes: number } | null;
+}
+
+/**
+ * Queued work nothing has woken for: a job more than 10 minutes past its
+ * run_after. The kick and the hand-on carry the queue and Hobby's cron runs
+ * once a day, so a lost kick or a capped chain could leave a broker's step
+ * waiting for hours with nothing on the record. /api/health reports this
+ * (Task 11.2); the worker raises it at the start of each run (noteOverdueJobs).
+ */
+export async function overdueJobs(now = Date.now()): Promise<OverdueReport> {
+  const { data, error, count } = await db()
+    .from("jobs")
+    .select("id, kind, run_after", { count: "exact" })
+    .eq("status", "queued")
+    .lt("run_after", new Date(now - OVERDUE_MS).toISOString())
+    .order("run_after", { ascending: true })
+    .limit(1);
+  if (error) throw new Error(`overdueJobs failed: ${errorText(error)}`);
+  const row = ((data as { id: number; kind: string; run_after: string }[] | null) ?? [])[0];
+  return {
+    count: count ?? 0,
+    oldest: row ? { id: row.id, kind: row.kind, minutes: Math.floor((now - Date.parse(row.run_after)) / 60_000) } : null,
+  };
+}
+
+/**
+ * The worker's first act (api/worker.ts), before its drain takes the work:
+ * overdue jobs are an immediate incident (job_overdue), because a broker has
+ * been waiting on work that did not happen by itself. Never throws.
+ */
+export async function noteOverdueJobs(): Promise<OverdueReport | null> {
+  try {
+    const overdue = await overdueJobs();
+    if (overdue.count > 0 && overdue.oldest) {
+      const { kind, minutes } = overdue.oldest;
+      const many = overdue.count > 1;
+      trackFailure("job_overdue", `${overdue.count} queued job${many ? "s" : ""} overdue by more than ${OVERDUE_MS / 60_000} min`, {
+        severity: "error",
+        alert: "immediate",
+        props: { count: overdue.count, oldest_kind: kind, oldest_minutes: minutes },
+        fingerprint: "job_overdue",
+        summary: `${overdue.count} queued job${many ? "s" : ""} waited more than ${OVERDUE_MS / 60_000} minutes past ${many ? "their" : "its"} time (the oldest, a ${kind.replace(/_/g, " ")} job, ${minutes} min): nothing woke the queue until this run`,
+      });
+    }
+    return overdue;
+  } catch (err) {
+    trackFailure("overdue_check_failed", err, { severity: "warn", alert: "digest", fingerprint: "overdue_check_failed" });
+    return null;
+  }
+}
+
 /**
  * Throws JobFencedError if this code runs inside a job attempt that no longer
  * owns its job. Called before every write or send a stale attempt must not
@@ -388,6 +522,12 @@ async function sessionGone(job: JobRow): Promise<boolean> {
   // A read that failed is not a deleted session: the step runs, and fails on its own if the database is down.
   if (error) return false;
   return !data;
+}
+
+/** The job's row is gone: deleted with its session (jobs.session_id ON DELETE CASCADE). */
+async function jobGone(id: number): Promise<boolean> {
+  const { data, error } = await db().from("jobs").select("id").eq("id", id).maybeSingle();
+  return !error && !data;
 }
 
 // ── How deep a chain of self-calls is ────────────────────────────
@@ -433,7 +573,7 @@ export async function kickWorker(label = "kick"): Promise<boolean> {
     return false;
   }
   const url = `${env.PUBLIC_BASE_URL.replace(/\/$/, "")}/api/worker?async=1&max=10&hop=${nextHop()}`;
-  const wake = () => fetch(url, { method: "POST", headers: { Authorization: `Bearer ${env.WORKER_SECRET}` }, signal: AbortSignal.timeout(15_000) });
+  const wake = () => fetch(url, { method: "POST", headers: { Authorization: `Bearer ${env.WORKER_SECRET}` }, signal: AbortSignal.timeout(SELF_CALL_TIMEOUT_MS) });
   try {
     // One retry: a cold start can outlast one attempt, and a lost wake-up is
     // work left for the next trigger (Charlie round 14).
@@ -465,16 +605,12 @@ export async function kickWorker(label = "kick"): Promise<boolean> {
  * A drain that did work and leaves work behind wakes a fresh worker and
  * returns. It hands on only after doing something, so a queue that cannot
  * move — every job waiting on a busy session — never turns into a loop of
- * empty wake-ups.
+ * empty wake-ups. Throws when it cannot read the queue (the drain records it).
  */
 async function handOn(label: string): Promise<void> {
-  try {
-    const due = await queuedWorkDue(HAND_ON_WITHIN_MS);
-    if (due.ready === 0 && due.soonestMs === null) return;
-    await kickWorker(label);
-  } catch (err) {
-    console.warn(`drain[${label}]: hand-on failed`, errorText(err));
-  }
+  const due = await queuedWorkDue(HAND_ON_WITHIN_MS);
+  if (due.ready === 0 && due.soonestMs === null) return;
+  await kickWorker(label);
 }
 
 // ── Draining ─────────────────────────────────────────────────────
@@ -486,34 +622,41 @@ export interface DrainOptions {
   budgetMs?: number;
   /**
    * From the drain's start, when job attempts must be finished (default
-   * budgetMs + 30 s: 270 s, inside the 300 s kill). Model calls will not start
-   * past it (jobctx.ts jobMsLeft), so a slow job fails where the queue can see
-   * it instead of being killed where nothing can.
+   * budgetMs + HARD_STOP_MARGIN_MS: 250 s, leaving the tail its time before
+   * the 300 s kill). Model calls will not start past it (jobctx.ts jobMsLeft),
+   * so a slow job fails where the queue can see it instead of being killed
+   * where nothing can.
    */
   hardStopMs?: number;
   /** Lanes: sessions run side by side (default 3). */
   parallel?: number;
   label?: string;
   /**
-   * When nothing can run right now but a queued job becomes runnable within
-   * this long (a retry's backoff, a short hold), wait for it inside this
-   * invocation instead of ending. Only the hand-on worker sets it, at the top
-   * of its own budget; without it a 10 s backoff would wait for the next
-   * trigger, which on Hobby can be a day.
+   * When nothing can run right now but a queued job becomes runnable before
+   * this drain stops claiming (a retry's 10 s or 60 s backoff, a short hold),
+   * wait for it inside this invocation instead of ending, whether or not the
+   * drain has done work already. Hobby's cron runs once a day and a chain of
+   * self-calls stops at MAX_WORKER_HOP, so without it a step's second attempt
+   * could wait a day for the next trigger (Task 0.4 review). The worker's
+   * hand-on and its tick set it; tests that step the clock themselves do not.
    */
-  waitForDueMs?: number;
+  waitForDue?: boolean;
   /** Don't wake a fresh worker when work is left. */
   noHandOn?: boolean;
 }
 
 export interface DrainReport {
+  /** False when the queue's own machinery failed: a claim, a settle, the hand-on. The worker answers 500. */
+  ok: boolean;
+  /** What failed, masked and short (each is also an incident). */
+  errors: string[];
   claimed: number;
   done: number;
   /** Attempts that failed: retried with backoff, or failed for good. */
   failed: number;
   /** Put back without spending an attempt: a busy session, a JobHoldError, a first out-of-time. */
   held: number;
-  /** Stopped because another worker had reclaimed the job (jobctx.ts). */
+  /** Stopped because another worker had reclaimed the job, or its row went with its session (jobctx.ts). */
   fenced: number;
   /** Finished without running: the session was forgotten (C-0491). */
   skipped: number;
@@ -531,15 +674,24 @@ export async function drain(opts: DrainOptions = {}): Promise<DrainReport> {
   const budgetMs = opts.budgetMs ?? WORKER_BUDGET_MS;
   const parallel = Math.max(1, Math.min(Math.floor(opts.parallel ?? PARALLEL_SESSIONS), maxJobs));
   const label = opts.label ?? "worker";
+  const waitForDue = opts.waitForDue === true;
   const started = Date.now();
   const me = workerId(label);
-  const report: DrainReport = { claimed: 0, done: 0, failed: 0, held: 0, fenced: 0, skipped: 0 };
+  const report: DrainReport = { ok: true, errors: [], claimed: 0, done: 0, failed: 0, held: 0, fenced: 0, skipped: 0 };
+
+  /** The queue's own machinery failed: an incident, and the report says so (Task 0.4 review: these were console lines only). */
+  const machineryFailed = (name: string, what: string, err: unknown, opts: TrackOptions): void => {
+    report.ok = false;
+    report.errors.push(cutSafe(`${what}: ${errorText(err)}`, 300));
+    trackFailure(name, err, opts);
+  };
 
   // With a way to hand on, stop STARTING jobs well before the invocation's
   // 300-second kill: a step started with a minute to live is killed mid-way,
   // and a killed drain never hands on. What is left goes to a fresh worker
-  // with a full budget instead.
-  const canHandOn = !opts.noHandOn && selfCallsAllowed();
+  // with a full budget instead. The deepest worker of a chain (MAX_WORKER_HOP)
+  // has no fresh worker to leave it to, so it uses its whole budget.
+  const canHandOn = !opts.noHandOn && selfCallsAllowed() && mayWakeWorker();
   const claimUntil = canHandOn ? Math.max(budgetMs * 0.6, budgetMs - 90_000) : budgetMs;
   const hardStopAt = started + (opts.hardStopMs ?? budgetMs + HARD_STOP_MARGIN_MS);
   const mayClaim = (): boolean => Date.now() - started < claimUntil;
@@ -547,9 +699,12 @@ export async function drain(opts: DrainOptions = {}): Promise<DrainReport> {
   // Lanes share the claim count and a "something finished" signal: a lane
   // that finds nothing claimable while another is still working waits for it,
   // because what that one finishes may be what its session's next job waits on.
+  // With waitForDue, lane 0 is the one that waits for due work; the others wait
+  // on it (and run beside it once the work is due) until it has given up.
   let reserved = 0;
   let busy = 0;
   let waitingForDue = false;
+  let waiterDone = false;
   let broken = false;
   let wake: () => void = () => {};
   let changed = new Promise<void>((r) => (wake = r));
@@ -569,38 +724,46 @@ export async function drain(opts: DrainOptions = {}): Promise<DrainReport> {
         job = await claimJob(worker);
       } catch (err) {
         reserved--;
-        console.error(`drain[${label}]: claim_job failed`, errorText(err));
+        // Nothing can be claimed at all (a migration not applied, a revoked
+        // grant, a function signature that drifted): the most important
+        // failure of all, and it used to be one console line and a 200.
+        if (!broken) {
+          machineryFailed("claim_job_failed", "claim_job", err, {
+            severity: "critical",
+            alert: "immediate",
+            props: { label },
+            fingerprint: "claim_job_failed",
+            summary: `claim_job failed (${errorText(err).slice(0, 120)}): no queued work can run until it is fixed`,
+          });
+        }
         broken = true;
         signal();
         return;
       }
       if (!job) {
         reserved--;
-        if (busy > 0 || waitingForDue) {
+        if (busy > 0 || waitingForDue || (waitForDue && n !== 0 && !waiterDone)) {
           await changed;
           continue;
         }
-        // Nothing claimable now. Only the first lane of a worker that has not
-        // started anything yet waits (the freshly woken hand-on worker, at the
-        // top of its full budget): once a drain has done work it ends instead,
-        // and handOn wakes a fresh worker for whatever becomes due.
-        const wait = opts.waitForDueMs ?? 0;
-        if (n === 0 && wait > 0 && report.claimed === 0) {
+        if (n === 0 && waitForDue) {
           waitingForDue = true;
           try {
-            const due = await queuedWorkDue(wait).catch(() => ({ ready: 0, soonestMs: null, nextMs: null }));
             const left = claimUntil - (Date.now() - started);
+            const due = await queuedWorkDue(Math.max(0, left)).catch(() => ({ ready: 0, soonestMs: null, nextMs: null }));
             // Something due by now that claim_job would not hand out may have
             // become due between the two queries, or be clock skew: retry the
             // claim a couple of times before giving up on it.
             if (due.ready > 0 && reclaimTries < 2 && left > 5_000) {
               reclaimTries++;
-              await sleep(1_000);
+              await pause(1_000);
               continue;
             }
-            // The soonest job that is not due yet (a retry's backoff).
+            // The soonest job that is not due yet (a retry's backoff), if it
+            // falls due with time left to run it.
             if (due.nextMs !== null && due.nextMs + 5_000 < left) {
-              await sleep(due.nextMs + 250);
+              reclaimTries = 0;
+              await pause(due.nextMs + 250);
               continue;
             }
           } finally {
@@ -610,6 +773,7 @@ export async function drain(opts: DrainOptions = {}): Promise<DrainReport> {
         }
         return;
       }
+      reclaimTries = 0;
       report.claimed++;
       busy++;
       try {
@@ -617,8 +781,14 @@ export async function drain(opts: DrainOptions = {}): Promise<DrainReport> {
       } catch (err) {
         // Only the queue's own bookkeeping can land here (a retry that could
         // not be written): the job keeps its lock, and claim_job hands it out
-        // again once the lock is 120 s old. Logged, never lost.
-        console.error(`drain[${label}]: job ${job.id} could not be settled`, errorText(err));
+        // again once the lock is 120 s old. On the record, never lost.
+        machineryFailed("job_unsettled", `job ${job.id} (${job.kind}) could not be settled`, err, {
+          severity: "error",
+          alert: "immediate",
+          props: { kind: job.kind, job_id: job.id },
+          fingerprint: `job_unsettled:${job.kind}`.slice(0, 200),
+          summary: `A ${job.kind.replace(/_/g, " ")} job's outcome could not be written (${errorText(err).slice(0, 120)}); it is retried once its lock is ${LOCK_TIMEOUT_MS / 1000} s old`,
+        });
       } finally {
         busy--;
         signal();
@@ -626,12 +796,34 @@ export async function drain(opts: DrainOptions = {}): Promise<DrainReport> {
     }
   };
 
-  await Promise.all(Array.from({ length: parallel }, (_, n) => lane(n)));
+  await Promise.all(
+    Array.from({ length: parallel }, (_, n) =>
+      lane(n).finally(() => {
+        if (n === 0) {
+          waiterDone = true;
+          signal();
+        }
+      }),
+    ),
+  );
 
   if (report.claimed) console.log(`drain[${label}]: ${JSON.stringify(report)}`);
   // C-1610: everything the jobs recorded is written before the worker answers.
   await flushTracking();
-  if (report.claimed > 0 && canHandOn) await handOn(label);
+  if (report.claimed > 0 && canHandOn) {
+    try {
+      await handOn(label);
+    } catch (err) {
+      machineryFailed("hand_on_failed", "hand-on", err, {
+        severity: "warn",
+        alert: "digest",
+        props: { label },
+        fingerprint: "hand_on_failed",
+        summary: `A worker could not read the queue to hand on (${errorText(err).slice(0, 120)}): what is left waits for the next kick or the daily tick`,
+      });
+      await flushTracking();
+    }
+  }
   return report;
 }
 
@@ -685,15 +877,21 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
 
     // One session, one worker at a time (see otherJobRunningFor).
     if (job.session_id && (await otherJobRunningFor(job.session_id, job.id))) {
-      await holdJob(job.id, job.attempts, "another job of this session is still running", HOLD_MS, worker);
-      report.held++;
-      track("job_held", { category: "performance", props: { ...facts, reason: "session_busy" } });
+      if (await holdJob(job.id, job.attempts, "another job of this session is still running", HOLD_MS, worker)) {
+        report.held++;
+        track("job_held", { category: "performance", props: { ...facts, reason: "session_busy" } });
+      } else report.fenced++;
       return;
     }
 
     // "Forget me" landed between two steps: the step writes nothing (C-0491).
+    // In Postgres a job whose session_id was deleted is deleted with it; what
+    // reaches here is one whose session went between claim_job and this
+    // check, or one that names its session only in its payload.
     if (await sessionGone(job)) {
-      if (await finishJob(job.id, "skipped", "the session no longer exists (forgotten or deleted)", worker)) {
+      // Task 0.6: capture job lifecycle (skipped: session gone)
+      const settled = await finishJob(job.id, "skipped", "the session no longer exists (forgotten or deleted)", worker);
+      if (settled || (await jobGone(job.id))) {
         report.skipped++;
         track("job_skipped", { category: "behaviour", props: { ...facts, reason: "session_gone" } });
       } else report.fenced++;
@@ -703,10 +901,39 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
     const ctx: JobCtx = { id: job.id, worker, deadlineAt: hardStopAt, lastAttempt: job.attempts >= MAX_ATTEMPTS, attempt: job.attempts, kind: job.kind };
     nextSteps.set(ctx, []);
     // Heartbeat (jobctx.ts): refresh the lock while this attempt works, so a
-    // slow model call never lets the job look abandoned.
-    const beat = setInterval(() => void touchJob(job.id, worker).catch(() => {}), heartbeatMs);
+    // slow model call never lets the job look abandoned. A beat that fails, or
+    // finds the lock no longer this attempt's (another worker reclaimed it),
+    // leaves one trace for the attempt: a reclaim under a live attempt used to
+    // leave none at all.
+    let live = true;
+    let beatTraced = false;
+    const traceBeat = (reason: "error" | "lock_lost", err?: unknown): void => {
+      if (!live || beatTraced) return;
+      beatTraced = true;
+      trackFailure("job_heartbeat_failed", err ?? "the lock was no longer this attempt's", {
+        severity: "warn",
+        alert: "digest",
+        props: { ...facts, reason },
+        fingerprint: `job_heartbeat_failed:${job.kind}`,
+        summary:
+          reason === "lock_lost"
+            ? `${what}'s heartbeat found its lock taken by another worker while the attempt was still running`
+            : `${what}'s heartbeat could not refresh its lock (${errorText(err).slice(0, 120)}): another worker may reclaim it mid-attempt`,
+      });
+    };
+    const beat = setInterval(
+      () =>
+        void touchJob(job.id, worker).then(
+          (touched) => {
+            if (!touched) traceBeat("lock_lost");
+          },
+          (err) => traceBeat("error", err),
+        ),
+      heartbeatMs,
+    );
     try {
       await jobCtx.run(ctx, () => handler(job, ctx));
+      live = false;
       // The step returned, so its writes are committed: only now the steps after it.
       const queued = nextSteps.get(ctx) ?? [];
       if (queued.length && !(await stillOwnJob(job.id, worker))) {
@@ -719,14 +946,23 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
         track("job_done", { category: "performance", ms: since(startedAt), props: facts });
       } else report.fenced++;
     } catch (err) {
+      live = false;
       await settleFailure(job, worker, err, report, { facts, sessionRef, what, startedAt });
     } finally {
+      live = false;
       clearInterval(beat);
       nextSteps.delete(ctx);
     }
   });
 }
 
+/**
+ * A failed attempt, settled. Every settle is a write conditional on this
+ * attempt still holding the job, and one that touches no row means another
+ * worker reclaimed the job between the ownership check and the write: that is
+ * counted fenced, with no retry, hold or job_failed for a job someone else is
+ * running (Task 0.4 review: those writes' results were ignored).
+ */
 async function settleFailure(
   job: JobRow,
   worker: string,
@@ -748,9 +984,10 @@ async function settleFailure(
   }
   // Not a failure: the job is waiting on other work (jobctx.ts JobHoldError).
   if (err instanceof JobHoldError) {
-    await holdJob(job.id, job.attempts, err.message, err.delayMs, worker);
-    report.held++;
-    track("job_held", { category: "performance", props: { ...about.facts, ms_held: err.delayMs } });
+    if (await holdJob(job.id, job.attempts, err.message, err.delayMs, worker)) {
+      report.held++;
+      track("job_held", { category: "performance", props: { ...about.facts, ms_held: err.delayMs } });
+    } else report.fenced++;
     return;
   }
   // Out of time (jobctx.ts DeadlineError, C-0493): not a failure, the first
@@ -760,16 +997,20 @@ async function settleFailure(
   // be requeued for ever.
   const message = errorText(err);
   if (err instanceof DeadlineError && !/out of time/.test(job.last_error ?? "")) {
-    await holdJob(job.id, job.attempts, err.message, 0, worker);
-    report.held++;
-    track("job_out_of_time", { category: "performance", ms: since(about.startedAt), props: about.facts });
+    if (await holdJob(job.id, job.attempts, err.message, 0, worker)) {
+      report.held++;
+      track("job_out_of_time", { category: "performance", ms: since(about.startedAt), props: about.facts });
+    } else report.fenced++;
     return;
   }
 
-  report.failed++;
   console.log(`job ${job.id} (${job.kind}) attempt ${job.attempts} failed:`, message);
   if (job.attempts >= MAX_ATTEMPTS) {
-    await finishJob(job.id, "failed", message, worker);
+    if (!(await finishJob(job.id, "failed", message, worker))) {
+      report.fenced++;
+      return;
+    }
+    report.failed++;
     // Work a broker is waiting for that will not happen by itself: the email goes at once (alerts.ts, C-1541).
     trackFailure("job_failed", err, {
       severity: "error",
@@ -780,7 +1021,11 @@ async function settleFailure(
       summary: `${about.what} failed ${job.attempts} times and gave up${about.sessionRef ? ` (session ${about.sessionRef})` : ""}: ${message.slice(0, 160)}`,
     });
   } else {
-    await scheduleRetry(job.id, job.attempts, message, worker);
+    if (!(await scheduleRetry(job.id, job.attempts, message, worker))) {
+      report.fenced++;
+      return;
+    }
+    report.failed++;
     trackFailure("job_retry", err, {
       severity: "warn",
       alert: "digest",

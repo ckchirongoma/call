@@ -22,7 +22,9 @@ import * as queue from "../api/_lib/queue.ts";
 import { IMMEDIATE_GAP_MS, SAME_PROBLEM_COOLDOWN_MS, runAlerts } from "../api/_lib/alerts.ts";
 import { SANDBOX_FROM, alertRecipients, alertsConfigured, sendEmail, sendEmailTo } from "../api/_lib/email.ts";
 import { currentTrackContext, flushTracking, onTrack, setTrackContext, track, trackFailure, tracked, withTrackContext } from "../api/_lib/track.ts";
+import { __clearModelCache, askJSON } from "../api/_lib/models.ts";
 import { GET as health } from "../api/health.ts";
+import { GET as workerGET } from "../api/worker.ts";
 
 const BROKER = "00000000-0000-4000-8000-0000000000b1";
 const S1 = "5e550001-0000-4000-8000-000000000001";
@@ -130,20 +132,28 @@ describe("alerts: the immediate email", () => {
     process.env.TRACKING_OFF = "0";
     acceptEmail();
     assert.equal(SAME_PROBLEM_COOLDOWN_MS, 30 * MIN);
+    // An immediate-level problem: work a broker waits for that will not happen by itself (a failed
+    // delivery is a digest, C-1543, so it is not this email's to send).
     const fail = () =>
-      trackFailure("delivery_failed", new Error("Resend 422 validation_error"), { severity: "error", fingerprint: "delivery_failed:email", summary: "A quotation email was refused by Resend" });
+      trackFailure("job_failed", new Error("the writer is down"), {
+        severity: "error",
+        alert: "immediate",
+        fingerprint: "job_failed:write_quote",
+        summary: "The write quote job failed 3 times and gave up",
+      });
 
     fail();
     await flushTracking();
-    const [row] = incidents("delivery_failed");
+    const [row] = incidents("job_failed");
     assert.equal(row!.count, 1);
+    assert.equal(row!.alert_level, "immediate");
     const firstAt = row!.first_at;
     assert.equal((await runAlerts()).immediate, 1);
 
     clock.advance(1 * MIN);
     fail();
     await flushTracking();
-    assert.equal(incidents("delivery_failed").length, 1, "one row per fingerprint");
+    assert.equal(incidents("job_failed").length, 1, "one row per fingerprint");
     assert.equal(row!.count, 2, "count increments");
     assert.equal(row!.last_at, clock.iso(), "last_at moves");
     assert.equal(row!.first_at, firstAt, "first_at stays");
@@ -155,11 +165,120 @@ describe("alerts: the immediate email", () => {
 
     clock.advance(25 * MIN);
     assert.equal((await runAlerts()).immediate, 1, "30 minutes on, and it grew since the last email: sent again");
-    assert.match((emails[1]!.json as Row).text, /2 in total/);
+    assert.match((emails[1]!.json as Row).text, /1 new \(2 in total/);
 
     clock.advance(31 * MIN);
     assert.equal((await runAlerts()).immediate, 0, "not grown since: nothing to say");
     assert.equal(emails.length, 2);
+  });
+
+  test("the caller's alert level decides: immediate is emailed at once, digest waits for the daily digest the tick sends, none is never emailed; with no level, error and critical are immediate", async () => {
+    process.env.TRACKING_OFF = "0";
+    acceptEmail();
+    trackFailure("delivery_failed", new Error("Resend 422 validation_error"), { severity: "error", alert: "digest", fingerprint: "delivery_failed:email", summary: "A quotation email was refused by Resend" });
+    trackFailure("model_call_failed", "out of time", { severity: "warn", alert: "none", fingerprint: "model_call_failed:extract:out_of_time_retried", summary: "An extract call had no time left; the job goes to a fresh worker" });
+    trackFailure("guardrail_down", "unreachable", { severity: "critical", fingerprint: "guardrail_down", summary: "The guardrails are unreachable" });
+    track("slow_page", { category: "performance", severity: "warn", fingerprint: "slow_page", summary: "The dashboard took 9 s" });
+    await flushTracking();
+    const level = (fp: string) => fake.tables.incidents.find((r) => r.fingerprint === fp)?.alert_level;
+    assert.deepEqual(
+      ["delivery_failed:email", "model_call_failed:extract:out_of_time_retried", "guardrail_down", "slow_page"].map(level),
+      ["digest", "none", "immediate", "digest"],
+      "the hint as given; without one, critical is immediate and a warning a digest",
+    );
+
+    const now = await runAlerts();
+    assert.deepEqual({ immediate: now.immediate, digest: now.digest }, { immediate: 1, digest: 0 }, "an ordinary pass sends no digest");
+    assert.equal(emails.length, 1);
+    assert.match((emails[0]!.json as Row).text, /guardrails are unreachable/);
+    assert.doesNotMatch((emails[0]!.json as Row).text, /quotation email|dashboard took|no time left/);
+
+    // The daily tick sends the digest: the digest-level problems, and never a 'none' one.
+    clock.advance(10 * MIN);
+    const tick = await (await workerGET(new Request("https://call.test/api/worker?tick=1", { headers: { authorization: "Bearer test-cron-secret" } }))).json();
+    assert.equal(tick.alerts.digest, 2);
+    assert.equal(emails.length, 2);
+    const digest = emails[1]!.json as Row;
+    assert.match(digest.subject, /^\[Call\] Daily digest/);
+    assert.match(digest.text, /quotation email was refused/);
+    assert.match(digest.text, /dashboard took 9 s/);
+    assert.doesNotMatch(digest.text, /no time left|guardrails/);
+    assert.match(digest.html, /<table role="presentation"/);
+
+    // A second tick the same day (a cron delivered twice, or the next problem an hour on): no second digest.
+    clock.advance(60 * MIN);
+    trackFailure("delivery_failed", new Error("Resend 422 validation_error"), { severity: "error", alert: "digest", fingerprint: "delivery_failed:email", summary: "A quotation email was refused by Resend" });
+    await flushTracking();
+    assert.equal((await runAlerts({ digest: true })).digest, 0);
+    // The next day's tick carries what is new since.
+    clock.advance(24 * 60 * MIN);
+    assert.equal((await runAlerts({ digest: true })).digest, 1);
+    assert.match((emails[2]!.json as Row).text, /1 new \(2 in total/);
+    assert.equal(emails.length, 3);
+  });
+
+  test("a model call that fails on every model is a model_call_failed digest, never an immediate email", async () => {
+    process.env.TRACKING_OFF = "0";
+    acceptEmail();
+    __clearModelCache();
+    fake.tables.model_config.push({ role: "extract", provider: "openrouter", model: "test/extract-a", fallbacks: [], params: {}, enabled: true });
+    net.onModel(/[\s\S]*/, () => new Response('{"error":{"message":"overloaded"}}', { status: 503 }));
+    await assert.rejects(askJSON("extract", "Extract the facts from the transcript below.", { label: "extract_facts" }));
+    await flushTracking();
+    const [row] = incidents("model_call_failed");
+    assert.ok(row);
+    assert.equal(row.alert_level, "digest");
+    assert.equal((await runAlerts()).immediate, 0);
+    assert.equal(emails.length, 0, "a passing free-model outage is not a page");
+  });
+
+  test("two alert passes at once send one email: the slot is taken by one conditional write", async () => {
+    process.env.TRACKING_OFF = "0";
+    acceptEmail();
+    await failJob("write_quote", S1);
+    const [a, b] = await Promise.all([runAlerts(), runAlerts()]);
+    assert.equal(a.immediate + b.immediate, 1);
+    assert.equal(emails.length, 1);
+    assert.equal(alertRows().length, 1);
+  });
+
+  test("an alert email is on the record before it is sent, with Resend's idempotency key: a send whose record cannot be completed is never sent again", async () => {
+    process.env.TRACKING_OFF = "0";
+    net.onFetch("api.resend.com/emails", (call) => {
+      emails.push(call);
+      // The email goes; then the database is gone before the record says so.
+      fake.failTable("audit_log", { code: "57014", message: "canceling statement due to statement timeout" });
+      return jsonResponse({ id: `email-${emails.length}` });
+    });
+    await failJob("write_quote", S1);
+    await runAlerts();
+    fake.failTable("audit_log", null);
+    assert.equal(emails.length, 1);
+    assert.match(String(emails[0]!.headers["idempotency-key"]), /^alert:[0-9a-f-]{36}$/);
+    assert.equal(alertRows().length, 1, "recorded before the send");
+
+    clock.advance(6 * MIN);
+    await runAlerts();
+    clock.advance(40 * MIN);
+    await runAlerts();
+    assert.equal(emails.length, 1, "not sent again, however many passes follow");
+  });
+
+  test("an incident last emailed days ago reports what is new since that email, not its lifetime count", async () => {
+    process.env.TRACKING_OFF = "0";
+    acceptEmail();
+    const fail = () => trackFailure("job_failed", "x", { severity: "error", alert: "immediate", fingerprint: "job_failed:write_quote", summary: "The write quote job failed 3 times and gave up" });
+    fail();
+    await flushTracking();
+    assert.equal((await runAlerts()).immediate, 1);
+    assert.match((emails[0]!.json as Row).text, /1 new \(1 in total/);
+    clock.advance(2 * 24 * 60 * MIN);
+    fail();
+    fail();
+    fail();
+    await flushTracking();
+    assert.equal((await runAlerts()).immediate, 1);
+    assert.match((emails[1]!.json as Row).text, /3 new \(4 in total/);
   });
 
   test("[C-1548] with ALERT_EMAIL_TO unset, alerts are incidents only, nothing is sent, and health says alerts: unconfigured", async () => {
@@ -221,7 +340,7 @@ describe("alerts: the immediate email", () => {
     });
     await failJob("send_quote", S1);
     assert.equal((await runAlerts()).immediate, 0);
-    assert.equal(alertRows().length, 0);
+    assert.ok(alertRows().every((r) => r.after.status === "failed"), "the record says it did not go");
     await flushTracking();
     assert.equal(incidents("alert_email_failed").length, 1);
     assert.equal(incidents("alert_email_failed")[0]!.severity, "warn", "never an error: a failing alert must not alert about itself");

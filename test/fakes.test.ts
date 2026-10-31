@@ -401,6 +401,53 @@ describe("fake database", () => {
       }
     });
 
+    test("a runnable forget_client job is claimed before anything else, and never waits behind its session's earlier jobs", async () => {
+      const clock = fakeClock("2026-10-31T08:00:00.000Z");
+      try {
+        const s1 = "00000000-0000-4000-8000-0000000000a1";
+        await db().from("jobs").insert([
+          job({ kind: "extract_facts", dedupe_key: "old-other", session_id: null, run_after: "2026-10-31T06:00:00.000Z" }),
+          // A send deferred to tomorrow (the day's email cap): queued, earlier, of the same session.
+          job({ kind: "send_quote", dedupe_key: "deferred-send", session_id: s1, run_after: "2026-11-01T00:00:00.000Z" }),
+          job({ kind: "forget_client", dedupe_key: "forget", session_id: s1, run_after: "2026-10-31T07:59:00.000Z" }),
+          job({ kind: "forget_client", dedupe_key: "forget-later", session_id: null, run_after: "2026-10-31T08:30:00.000Z" }), // not due
+        ]);
+        const claim = async (w: string) => ((await db().rpc("claim_job", { p_worker: w })).data as any[]).map((r) => r.dedupe_key);
+        assert.deepEqual(await claim("w1"), ["forget"], "first, though older work is due and the session's send is queued ahead of it");
+        assert.deepEqual(await claim("w2"), ["old-other"]);
+        assert.deepEqual(await claim("w3"), [], "a forget job that is not due waits like any other");
+      } finally {
+        clock.restore();
+      }
+    });
+
+    test("claim_job reads jobs, so it answers jobs' failTable() error", async () => {
+      await db().from("jobs").insert(job({}));
+      fake.failTable("jobs", { code: "42501", message: "permission denied for table jobs" });
+      const res = await db().rpc("claim_job", { p_worker: "w1" });
+      assert.equal(res.data, null);
+      assert.equal(res.error?.code, "42501");
+      assert.equal(fake.tables.jobs[0]!.status, "queued", "nothing claimed");
+      fake.failTable("jobs", null);
+      assert.equal(((await db().rpc("claim_job", { p_worker: "w1" })).data as any[]).length, 1);
+    });
+
+    test("deleting a session deletes its jobs (jobs.session_id ON DELETE CASCADE), and no other session's", async () => {
+      const s1 = "00000000-0000-4000-8000-0000000000a1";
+      const s2 = "00000000-0000-4000-8000-0000000000a2";
+      const broker_id = await addBroker();
+      await db().from("sessions").insert([s1, s2].map((id) => ({ id, broker_id, mode: "call", provider: "elevenlabs" })));
+      await db().from("jobs").insert([
+        job({ session_id: s1, status: "queued" }),
+        job({ session_id: s1, status: "running" }),
+        job({ session_id: s2, status: "queued" }),
+        job({ session_id: null, status: "queued" }),
+      ]);
+      const gone = await db().from("sessions").delete().eq("id", s1);
+      assert.equal(gone.error, null);
+      assert.deepEqual(fake.tables.jobs.map((j) => j.session_id), [s2, null], "queued and running jobs of the deleted session went with it");
+    });
+
     test("a job with the same dedupe_key is refused by the unique index", async () => {
       await db().from("jobs").insert(job({ dedupe_key: "ingest:conv_1" }));
       const again = await db().from("jobs").insert(job({ dedupe_key: "ingest:conv_1" }));
@@ -412,8 +459,23 @@ describe("fake database", () => {
   });
 
   describe('rpc("bump_incident")', () => {
-    const bump = (p_fingerprint: string, p_severity: string, p_summary: string, p_kind = "model_call_failed") =>
-      db().rpc("bump_incident", { p_fingerprint, p_kind, p_severity, p_summary });
+    const bump = (p_fingerprint: string, p_severity: string, p_summary: string, p_kind = "model_call_failed", p_alert_level = "digest") =>
+      db().rpc("bump_incident", { p_fingerprint, p_kind, p_severity, p_summary, p_alert_level });
+
+    test("the alert level is the caller's on a new row, and a repeat keeps the loudest it has had (immediate > digest > none)", async () => {
+      await bump("delivery_failed:email", "error", "refused", "delivery_failed", "digest");
+      await bump("job_failed:write_quote", "error", "gave up", "job_failed", "immediate");
+      await bump("job_failed:write_quote", "error", "gave up again", "job_failed", "digest");
+      await bump("model_call_failed:extract:out_of_time_retried", "warn", "retried", "model_call_failed", "none");
+      await bump("model_call_failed:extract:out_of_time_retried", "warn", "retried", "model_call_failed", "none");
+      await bump("delivery_failed:email", "error", "refused", "delivery_failed", "immediate");
+      const level = (fp: string) => fake.tables.incidents.find((r) => r.fingerprint === fp)?.alert_level;
+      assert.equal(level("job_failed:write_quote"), "immediate", "never quietened by a quieter repeat");
+      assert.equal(level("model_call_failed:extract:out_of_time_retried"), "none");
+      assert.equal(level("delivery_failed:email"), "immediate", "a louder repeat raises it");
+      const bad = await bump("x", "warn", "s", "k", "loud");
+      assert.equal(bad.error?.code, "23514", "the level is CHECKed to the three");
+    });
 
     test("one row per fingerprint: a repeat counts, moves last_at, keeps the worst severity and the latest summary", async () => {
       const clock = fakeClock("2026-10-31T08:00:00.000Z");
@@ -441,11 +503,11 @@ describe("fake database", () => {
       }
     });
 
-    test("it takes exactly its four text arguments, a severity outside the four is a check violation, and fingerprint is unique", async () => {
+    test("it takes exactly its five text arguments, a severity outside the four is a check violation, and fingerprint is unique", async () => {
       // A misspelt or missing argument is PGRST202 in production.
-      refused(() => db().rpc("bump_incident", { p_fingerprint: "x", p_kind: "k", p_severity: "warn" }), /p_fingerprint, p_kind, p_severity, p_summary/);
+      refused(() => db().rpc("bump_incident", { p_fingerprint: "x", p_kind: "k", p_severity: "warn", p_summary: "s" }), /p_fingerprint, p_kind, p_severity, p_summary, p_alert_level/);
       refused(() => db().rpc("bump_incident", { p_fingerprint: "x", p_kind: "k", p_severity: "warn", p_summary: "s", p_alert: "digest" }), /p_alert/);
-      refused(() => db().rpc("bump_incident", { p_fingerprint: null, p_kind: "k", p_severity: "warn", p_summary: "s" }), /text/);
+      refused(() => db().rpc("bump_incident", { p_fingerprint: null, p_kind: "k", p_severity: "warn", p_summary: "s", p_alert_level: "digest" }), /text/);
       const loud = await bump("x", "loud", "s");
       assert.equal(loud.error?.code, "23514");
       assert.equal(fake.tables.incidents.length, 0);
@@ -711,7 +773,7 @@ describe("fake database: refuses what Supabase would refuse", () => {
         ["jobs", { kind: "ingest_transcript" }, { payload: {}, status: "queued", attempts: 0, run_after: now }],
         ["webhook_events", { provider: "meta", event_type: "message", external_id: "wamid.demo2", signature_ok: true, raw: {} }, { received_at: now }],
         ["audit_log", { action: "approve", entity: "quote" }, { at: now }],
-        ["incidents", { kind: "model", severity: "warn", summary: "demo", fingerprint: "fp_demo" }, { first_at: now, last_at: now, count: 1 }],
+        ["incidents", { kind: "model", severity: "warn", summary: "demo", fingerprint: "fp_demo" }, { first_at: now, last_at: now, count: 1, alert_level: "digest" }],
         ["intel_events", { app: "call", trace_id: "t_demo", kind: "track", name: "demo", actor: "system" }, { at: now, seq: 0, v: 1, content_mode: "full" }],
       ];
       for (const [table, input, expected] of cases) {

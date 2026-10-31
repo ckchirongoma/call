@@ -35,7 +35,8 @@ export const RESEND_EMAILS_URL = "https://api.resend.com/emails";
  */
 export const SANDBOX_FROM = "onboarding@resend.dev";
 
-const SEND_TIMEOUT_MS = 10_000;
+/** One send's bound: alerts.ts and queue.ts count it in the worker's tail after its hard stop. */
+export const SEND_TIMEOUT_MS = 10_000;
 
 export interface EmailResult {
   ok: boolean;
@@ -142,8 +143,8 @@ export async function sendEmailTo(msg: EmailToMessage): Promise<EmailResult> {
   }
 }
 
-/** The alert email: to every valid address in ALERT_EMAIL_TO. */
-export async function sendEmail(msg: EmailMessage): Promise<EmailResult> {
+/** The alert email: to every valid address in ALERT_EMAIL_TO. alerts.ts passes the key of the record it wrote first, so a retried send cannot double it. */
+export async function sendEmail(msg: EmailMessage & { idempotencyKey?: string }): Promise<EmailResult> {
   if (!alertsConfigured()) return { ok: false, skipped: true, error: "email not configured" };
   return sendEmailTo({ ...msg, to: alertRecipients(), fromName: "Call alerts" });
 }
