@@ -16,7 +16,7 @@ the disclosures, the currency and the regulator's name are rows, not code.
 Companion documents: `docs/RESEARCH.md` (why these choices), `docs/AGENT-PROMPT.md`
 (what the voice agent says, question by question), `BEHAVIOR-MATRIX.md` (every
 state × event → behaviour, and the founder's standing instructions),
-`criteria/` (the acceptance criteria, 1,264 of them), and the implementation
+`criteria/` (the acceptance criteria, 1,337 of them), and the implementation
 plan in `docs/superpowers/plans/`.
 
 ---
@@ -41,8 +41,9 @@ failure, and extended for a regulated product. They are binding on every task.
 | R11 | **Minimality.** The agent never asks for, and the extractor refuses to store, an ID number, bank or card details, passwords, or medical history beyond "smoker yes/no" and "any condition a doctor treats you for, yes/no". | Agent prompt §4; `IDENTIFIER` refusal; redaction before storage (§7.2). |
 | R12 | **Human in the loop.** Nothing reaches a client until a broker user taps Approve, unless `brokers.auto_send = true`, which is off by default and labelled "demo". | `quotes.status` machine (§9). |
 | R13 | **A guardrail that is off is a row, not a silence.** Every check writes `safety_events` with `engine` ∈ {jev, model, rules, none}; `/api/health` shows `guardrails_live`. | Ported from Charlie `safety.ts`. |
-| R14 | **Consent first.** The first message says it is an AI, the call is recorded, what for; "no" ends the call and stores only the refusal. | Agent prompt §1; `consents` table. |
-| R15 | **Nothing is stored that cannot be deleted.** "Forget me" (dashboard or WhatsApp) deletes every row and file for that client within one job. | `forgetClient()` cascade test. |
+| R14 | **Consent first, and the truth about what is kept.** The first message says it is an AI, the call is recorded, it is used for the recommendation and kept to improve the service, and that "forget me" deletes it; "no" ends the call and stores only the refusal. | Agent prompt §1; `consents` table; `data_use` disclosure. |
+| R15 | **Nothing is stored that cannot be deleted.** "Forget me" (on the call, dashboard or WhatsApp) deletes every row and file for that client within one job, including every Chase Intelligence row and every trace they were in. | `forgetClient()` cascade test; `forgetIntel()`. |
+| R16 | **Every task is recorded whole (Chase Intelligence v1).** One id per session; every turn, tool call, model call, check, broker action, send and job, in order; never a secret or an identifier; never changes what the product does. | §16; `docs/INTEL-CONTRACT.md`; `criteria/13-intel.md`. |
 
 ---
 
@@ -201,7 +202,7 @@ product_pricing    id, product_id, age_from, age_to, smoker bool|null, rate_per_
 disclosures        id, country, key, text, verified_on            -- indicative, underwriting, FSP, recording
 
 model_config       role PK, provider, model, fallbacks text[], params jsonb, enabled bool
-jobs               id, kind, session_id, payload jsonb, status, attempts, run_after, locked_by,
+jobs               id bigint identity, kind, session_id, payload jsonb, status, attempts, run_after, locked_by,
                    locked_at, last_error, created_at
 webhook_events     id, provider ('elevenlabs'|'resend'|'meta'), event_type, external_id,
                    signature_ok bool, raw jsonb, received_at, UNIQUE (provider, external_id, event_type)
@@ -524,7 +525,7 @@ Every button is a `POST /app/actions` with `action=<id>` and a CSRF token
 
 ---
 
-## 14. Testing strategy (how 1,264 criteria get tested)
+## 14. Testing strategy (how 1,337 criteria get tested)
 
 - **Fakes** (`test/_fakes.ts`, ported and extended): in-memory Supabase (query shapes used here; unsupported shapes throw), fake Storage, scripted model gateway keyed on prompt markers, fake Resend, fake Meta, an **ElevenLabs event factory** that builds signed `post_call_transcription` / `post_call_audio` requests from a scripted conversation, and a fake clock.
 - **Scripted conversations** (`test/fixtures/conversations/*.json`): 40 transcripts covering every journey in §3 and every refusal in §7.3 — the happy path, dropped call, declined consent, misheard-then-corrected age, hardship, "what do you offer", identifier offered by the client, someone else's cover, hypothetical cover, negated cover, two needs over budget, known client second call, in-person meeting, web session without caller id, silence, prompt injection in a client turn, Afrikaans/isiZulu words for money, approximate figures.
@@ -533,6 +534,27 @@ Every button is a `POST /app/actions` with `action=<id>` and a CSRF token
 - **Live checks** (not in CI, in `HANDOFF.md`): one real browser-widget call end to end, one real phone call from a verified number, Resend delivery to a real inbox, WhatsApp template approval, print-to-PDF opened in a viewer.
 
 ---
+
+## 16. Chase Intelligence v1
+
+Call writes the shared Chase Intelligence contract (`docs/INTEL-CONTRACT.md`,
+copied unchanged) from its first line of code, so its rows join Charlie's and
+Charles' in one training dataset. One table, `intel_events` (in
+`db/0006_platform.sql`), one call, `capture(kind, opts)`, in
+`api/_lib/intel.ts`; redaction in `api/_lib/intelredact.ts` before the write
+and again on export; `scripts/intel-export.ts` and `scripts/intel-trace.ts`.
+
+The one id is the session: `s_<session_id>` on init, every tool call, both
+post-call events, every pipeline job, every broker action on the session's
+quotes, every send and every delivery status. What each layer captures is the
+plan's Capture map; Call's adaptations of the contract are
+`docs/INTEL-PHASE0.md` §3; the criteria are `criteria/13-intel.md`.
+
+Capture is additive: it never throws into the code it watches, never waits on
+the request path (< 5 ms p95), and never changes a result.
+`INTEL_CAPTURE` = `full` (default) | `meta` | `off`. A declined-consent session
+keeps the shape only. "Forget me" deletes every row about the client and every
+trace they were in. `intel_events` is never pruned by retention.
 
 ## 15. Out of scope for v1 (so nobody builds it by accident)
 

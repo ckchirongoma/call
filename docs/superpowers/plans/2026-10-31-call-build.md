@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node ≥ 22.6 (native type stripping), TypeScript 5, Vercel functions, `@supabase/supabase-js`, `puppeteer-core` + `@sparticuz/chromium` (PDF only), ElevenLabs Agents (REST for config push; webhooks in), OpenRouter (chat + audio endpoints), Resend, Meta WhatsApp Cloud API, optional Jev (TypeSafe). No other dependencies.
 
-**Spec:** `docs/SPEC.md` (design), `docs/AGENT-PROMPT.md` (agent), `BEHAVIOR-MATRIX.md` Part B (state × event), `criteria/*.md` (1,264 acceptance criteria), `docs/RESEARCH.md` (why). Executors read SPEC §0 and the task's criteria rows before starting.
+**Spec:** `docs/SPEC.md` (design), `docs/AGENT-PROMPT.md` (agent), `BEHAVIOR-MATRIX.md` Part B (state × event), `criteria/*.md` (1,337 acceptance criteria), `docs/INTEL-CONTRACT.md` + `docs/INTEL-PHASE0.md` (Chase Intelligence), `docs/RESEARCH.md` (why). Executors read SPEC §0 and the task's criteria rows before starting.
 
 **Reference implementation to port from:** `../charlie` (checked out beside this repo). Files named "port" below are copied, attributed in the header comment ("Ported from Charlie `api/_lib/x.ts`; the why-comments are kept"), then trimmed to what this repo uses.
 
@@ -26,6 +26,9 @@
 - Every model call: through `askJSON()` in `models.ts` with retries, fallbacks, truncation handling, `max_tokens ≥ 1200`.
 - Money is integer cents in the database; `formatRand(cents)` renders "R 1 235" (space thousands, whole rand).
 - Dates in documents: "31 October 2026"; times in the dashboard: SAST (`Africa/Johannesburg`).
+- **Chase Intelligence v1** (SPEC §16, BEHAVIOR-MATRIX A21, `criteria/13-intel.md`): every task that adds an entry point, a model call, a check, a tool, a send, a job, a person action or a status change adds its `capture()` call **in that task**, and its test asserts the row (kind, name, trace id). The Capture map below says which task captures what. Capture never throws, never awaits, never changes a result.
+- `jobs.id` is `bigint generated always as identity` (the contract's `job_id` is bigint).
+- **Merge, don't wait** (A13): each phase ends with a PR into `main`, merged as soon as verify and CI are green. **Test it yourself** (A19): the founder is never asked to test.
 - Commit after every task with a message in the imperative, ending with the session's attribution lines; never a model identifier in the commit.
 
 ## Review Focus
@@ -38,13 +41,42 @@ Inputs the spec implies but no single task's happy path exercises; each line's t
 4. **A broker edits a fact after the quote was sent.** A new version must exist, labelled not sent, and the sent version untouched (Task 8.3 test `[C-1162]`).
 5. **Resend's daily cap is hit mid-batch during a demo.** `send_quote` must queue to the next UTC day with status `approved`, not `failed`, and the dashboard must say so (Task 7.3 test `[C-1067][C-1068][C-1070]`).
 
+## Capture map (Chase Intelligence: which task adds which capture)
+
+| Task | Captures (kind `name`) | Criteria |
+|---|---|---|
+| 0.3 models | `model` per attempt, whole prompt and answer; transcription with audio as type and size | C-1721, C-1722 |
+| 0.4 queue, track | `job` enqueued/started/finished/failed/held/skipped; `track` and `error` for every `track()`/`trackFailure()` | C-1713, C-1732, C-1733 |
+| 0.6 intel core | `capture()`, buffer, flush, switch, ids, redaction, missing-table behaviour, `readTrace`, `forgetIntel` | C-1700–C-1716, C-1734–C-1743, C-1745–C-1746, C-1753–C-1754, C-1758, C-1765–C-1767 |
+| 1.1 migrations | `intel_events` in `db/0006_platform.sql`, RLS, revoke | C-1751, C-1752 |
+| 1.2 seeds | `data_use` disclosure says what is kept | C-1748 |
+| 3.1 init | `track voice:init` | C-1727 |
+| 3.2 tools | `tool <name>`, actor `model` | C-1726 |
+| 3.3 post-call | `track webhook:post_call_*` | C-1710 |
+| 3.4 ingest | `ask` per client turn, `say` per agent turn, `check` per ElevenLabs evaluation/data-collection result; declined consent → meta only; "forget me" on the call | C-1717, C-1718, C-1725, C-1744, C-1771 |
+| 2.3 / 4.2 facts | `check check:fact_refusal` | C-1724 |
+| 4.3, 6.2 checkers, safety | `check check:<name>` for every `safety_events` write | C-1723 |
+| 4.4 agent prompt | first message says what is kept and how to delete; "forget me" line | C-1747, C-1772 |
+| 6.4 pdf | `track pdf:rendered` | C-1735, C-1770 |
+| 7.1, 7.2 delivery | `say` (text) + `send` (payload minus address); `track delivery:<status>`; `ask` for WhatsApp in | C-1719, C-1720, C-1728, C-1729 |
+| 7.3 status machine | `track quote:<from>-><to>` | C-1731 |
+| 8.1 auth | login-code email as kind only | C-1741 |
+| 8.3–8.7 dashboard | `track broker:<action>`, actor `person`, channel `dashboard`, before/after/reason | C-1730, C-1769 |
+| 8.7 forget | `forgetIntel()` inside `forgetClient()` | C-1745 |
+| 8.8 admin, 11.2 health | intel counts, mode, buffered, dropped | C-1763, C-1764 |
+| 9.1 push-agent | `track agent:pushed` | C-1768 |
+| 10.1 meeting | consent panel says what is kept | C-1749 |
+| 11.1 retention | never touches `intel_events` | C-1750 |
+| 12.5 export, trace, proof | export, `intel-trace`, the one-id read-back, capture-off-vs-on, `test:intel` | C-1755–C-1757, C-1759–C-1762 |
+
 ---
 
 ## How the orchestrator runs this plan (BEHAVIOR-MATRIX A1–A3)
 
 1. Read `CLAUDE.md`, `BEHAVIOR-MATRIX.md`, `docs/SPEC.md`, this plan. Run `npm install && npm run criteria -- --count --matrix`.
 2. For each task, in order within a phase (phases may interleave only where the task says "parallel-safe"): dispatch a **fresh execution agent** with the brief template below; when it returns, dispatch a **fresh reviewer agent** with the review template; apply the reviewer's required changes via the same executor (SendMessage) or a new one; then run `npm run typecheck && npm test` yourself.
-3. At the end of each phase: `npm run verify`; `npm run criteria -- --missing | head -60` to see what the phase left; a **phase reviewer** agent reads the whole phase diff against SPEC §0 and Part B; fix; commit; push.
+3. At the end of each phase: `npm run typecheck && npm test && npm run test:intel`; `npm run criteria -- --missing | head -60` to see what the phase left; a **phase reviewer** agent reads the whole phase diff against SPEC §0, Part B and the Capture map; fix; commit; push; **open a PR into `main` and merge it once CI is green** (BEHAVIOR-MATRIX A13). Before Phase 0's PR: if the remote has no `main`, create it from the planning commit (`git push origin <planning-sha>:refs/heads/main`).
+   Until Task 12.2, CI's criteria step runs `--count --matrix` (untested criteria are expected mid-build); Task 12.2 switches it to `--check --matrix`.
 4. An executor spawns no agents. An executor that needs a decision the plan does not make stops and reports; the orchestrator decides and records the decision in the task's notes in this file.
 5. Never mark a criterion tagged without a test that would fail on the old code. The reviewer checks the red step's output is in the executor's report.
 
@@ -131,7 +163,24 @@ Inputs the spec implies but no single task's happy path exercises; each line's t
 - [ ] **Step 2–4.** Functions in `vercel.json`: `api/voice.ts` 60 s/1024 MB, `api/worker.ts` 300 s, `api/app.ts` 30 s, `api/meeting.ts` 60 s, `api/render-pdf.ts` 120 s/2048 MB with `includeFiles` for chromium, `api/health.ts` 15 s, `api/cron/*` 120 s; crons `/api/worker?tick=1`, `/api/cron/retention`, `/api/cron/keepalive`, `/api/cron/freshness` at schedules the Hobby plan allows (record the allowed minimum in VERIFIED.md; if once a day, the worker's hand-on and the webhook's kick carry the load, as in Charlie).
 - [ ] **Step 5: Commit** `Vercel config, health skeleton, static security tests`
 
-**Phase 0 gate:** `npm run verify` green (criteria check will fail on untested ids — run `--count` only until Phase 12; CI's `--check` step is added in Task 12.2). Push.
+### Task 0.6: Chase Intelligence core
+
+**Files:** Create `api/_lib/intel.ts` (port of Charlie `api/_lib/intel.ts` at commit `59b6cb4`, `APP = "call"`), `api/_lib/intelredact.ts` (port; add this deployment's secrets from `.env.example`, the `/q/…?sig=` signed-link shape, and the money-key allowlist for JSON numbers), `test/intel.test.ts`, `test/intel-redact.test.ts`. Modify `api/_lib/track.ts` (trace context carries `trace_id`, `session_id`, `client_id`, `broker_id`, `channel`, `stage`; every `track()`/`trackFailure()` also captures), `api/_lib/models.ts` (capture every attempt), `api/_lib/queue.ts` (capture job lifecycle; a job's context is its session's trace), `test/_fakes.ts` (an `intel_events` table; a switch to simulate the table missing).
+
+**Interfaces:**
+- `capture(kind: IntelKind, opts: { name: string; actor?: Actor; content?: unknown; meta?: Record<string, unknown>; ok?: boolean | null; ms?: number; channel?: Channel; turnId?: string }): void` — reads the trace context; never throws; never awaits.
+- `withTrace<T>(ctx: { traceId: string; sessionId?: string; clientId?: string; brokerId?: string; channel?: Channel; stage?: string; jobId?: number; contentMode?: "full"|"meta" }, fn: () => Promise<T>): Promise<T>` (AsyncLocalStorage).
+- `traceForSession(sessionId): string` → `"s_" + sessionId`; `requestTraceId(): string` → `"r_" + 16 hex`; `turnIdFor(sessionId, idx)`, `turnIdForWamid(wamid)`.
+- `flushIntel(): Promise<{ written: number; dropped: number }>` (batches ≤ 500 rows / 1 MB; 3 attempts; missing-table backoff 10 min).
+- `readTrace(id: string): Promise<IntelRow[]>`; `forgetIntel(clientId: string): Promise<number>` (written and buffered).
+- `redactText(s)`, `redactJson(v)`, `redactDeep(v)` in `intelredact.ts`.
+- `Channel = "phone"|"web"|"meeting"|"dashboard"|"email"|"whatsapp"|"system"`.
+
+- [ ] **Step 1: Failing tests** C-1700–C-1716, C-1721, C-1722, C-1732, C-1733, C-1734, C-1736–C-1743, C-1745, C-1746, C-1753, C-1754 (unit form, against the fakes), C-1758, C-1765–C-1767.
+- [ ] **Step 2: Run** → FAIL. **Step 3: Implement** (port, adapt per `docs/INTEL-PHASE0.md` §3). **Step 4: Run** `npm test` and `npm run test:intel` → PASS, same counts.
+- [ ] **Step 5: Commit** `Chase Intelligence: one id per session, every task recorded whole`
+
+**Phase 0 gate:** `npm run typecheck && npm test && npm run test:intel` green; criteria `--count --matrix` green. Push. Create `main` if missing; open the Phase 0 PR; merge when CI is green.
 
 ---
 
@@ -139,11 +188,11 @@ Inputs the spec implies but no single task's happy path exercises; each line's t
 
 ### Task 1.1: Migrations
 
-**Files:** Create `db/0001_core.sql` (brokers, broker_users, login_codes, sessions_auth, clients, sessions, turns, recordings, consents, callbacks, client_messages, meeting_chunks), `db/0002_model_config.sql`, `db/0003_facts.sql` (facts, fact_refusals), `db/0004_catalogue.sql` (product_categories, products, product_pricing, disclosures), `db/0005_quotes.sql` (needs, recommendations, quotes, deliveries, hardship_notes), `db/0006_platform.sql` (jobs + `claim_job` function, webhook_events, safety_events, usage_ledger, audit_log, incidents, storage buckets `recordings` and `quotes` private), `db/0007_rls.sql` (enable on all; policies on the three public tables), `test/rls.test.ts`, `test/migrations.test.ts`.
+**Files:** Create `db/0001_core.sql` (brokers, broker_users, login_codes, sessions_auth, clients, sessions, turns, recordings, consents, callbacks, client_messages, meeting_chunks), `db/0002_model_config.sql`, `db/0003_facts.sql` (facts, fact_refusals), `db/0004_catalogue.sql` (product_categories, products, product_pricing, disclosures), `db/0005_quotes.sql` (needs, recommendations, quotes, deliveries, hardship_notes), `db/0006_platform.sql` (jobs with `id bigint generated always as identity` + `claim_job` function, webhook_events, safety_events, usage_ledger, audit_log, incidents, **`intel_events` exactly as `docs/INTEL-CONTRACT.md` §1 with its four indexes and `REVOKE ALL … FROM anon, authenticated`**, storage buckets `recordings` and `quotes` private), `db/0007_rls.sql` (enable on all; policies on the three public tables), `test/rls.test.ts`, `test/migrations.test.ts`.
 
 Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.value_min/value_max numeric`, `sessions.provider_analysis jsonb`, `sessions.provider_summary text`, `sessions.provider_cost numeric`, `sessions.turn_count int`, `sessions.continues_session_id uuid`, `clients.whatsapp_e164`, `clients.last_inbound_at`, `recommendations.replaces_fact_id uuid`, `quotes.flags text[]`, `brokers.voice_id text`, `brokers.agent_llm text`, `webhook_events.processed_at`, `jobs.dedupe_key text unique`, `jobs.status check in ('queued','running','done','failed','cancelled','skipped')`.
 
-- [ ] **Step 1: Failing tests** `[C-1567][C-1568][C-1569][C-1570][C-1571][C-1576][C-1577][C-1578][C-1579][C-1580][C-1089]` — `rls.test.ts` parses every `CREATE TABLE` in `db/*.sql` and asserts an `ENABLE ROW LEVEL SECURITY` in the same file, the policy set, `created_at` on every table, `auto_send default false`, `claim_job` is `SECURITY DEFINER SET search_path`; `migrations.test.ts` runs each file twice against `TEST_DATABASE_URL` when set, else prints "skipped: no TEST_DATABASE_URL" (`[C-1575]`).
+- [ ] **Step 1: Failing tests** `[C-1567][C-1568][C-1569][C-1570][C-1571][C-1576][C-1577][C-1578][C-1579][C-1580][C-1089][C-1751][C-1752]` — `rls.test.ts` parses every `CREATE TABLE` in `db/*.sql` and asserts an `ENABLE ROW LEVEL SECURITY` in the same file, the policy set, `created_at` on every table, `auto_send default false`, `claim_job` is `SECURITY DEFINER SET search_path`; `migrations.test.ts` runs each file twice against `TEST_DATABASE_URL` when set, else prints "skipped: no TEST_DATABASE_URL" (`[C-1575]`).
 - [ ] **Step 2–4.** **Step 5: Commit** `Migrations 0001–0007: schema, model_config, catalogue, quotes, platform, RLS`
 
 ### Task 1.2: Seeds — categories, demo catalogue, pricing, disclosures, model_config
@@ -159,7 +208,7 @@ Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.valu
 
 - [ ] **Step 1: Failing test** `[C-1574]` regenerates and diffs. **Step 2–4.** **Step 5: Commit** `Generate the paste-ready Supabase prompt from the migrations`
 
-**Phase 1 gate.** Push.
+**Phase 1 gate.** Push; PR into `main`; merge when CI is green.
 
 ---
 
@@ -251,7 +300,7 @@ Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.valu
 - [ ] **Step 1: Failing tests** C-0427…C-0440 (store side), C-0114, C-1322, C-1560 (storage-full guard stub reading `limits.ts` later — write it to call a `storageBytes()` function in `limits.ts` created in Task 7.6; until then a local helper).
 - [ ] **Step 2–4.** **Step 5: Commit** `Store call audio privately with a delete-after date`
 
-**Phase 3 gate.** Push.
+**Phase 3 gate.** Push; PR into `main`; merge when CI is green.
 
 ---
 
@@ -287,7 +336,7 @@ Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.valu
 - [ ] **Step 1: Failing tests** every `prompt` row in criteria 02 (C-0100–C-0103, C-0107–C-0108, C-0117, C-0121, C-0124–C-0126, C-0131, C-0133–C-0135, C-0138, C-0141–C-0150, C-0154, C-0158, C-0161–C-0162, C-0169, C-0171–C-0172, C-0183–C-0186, C-0201–C-0204, C-0223–C-0224, C-0229–C-0230, C-0237, C-0243–C-0245, C-0254, C-0256–C-0259, C-0273, C-0277–C-0279, C-0292–C-0294, C-0300), C-1433.
 - [ ] **Step 2–4.** **Step 5: Commit** `The agent prompt is rendered from the document, never hand-edited`
 
-**Phase 4 gate.** Push.
+**Phase 4 gate.** Push; PR into `main`; merge when CI is green.
 
 ---
 
@@ -317,7 +366,7 @@ Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.valu
 
 - [ ] **Step 1: Failing tests** C-0761…C-0795, C-0817, C-0821…C-0850 (non-app rows), C-0263, C-0753–C-0760 (pipeline rows via a mini-pipeline test on the fakes). **Step 2–4.** **Step 5: Commit** `One product per need, every other one listed with why not`
 
-**Phase 5 gate.** Push.
+**Phase 5 gate.** Push; PR into `main`; merge when CI is green.
 
 ---
 
@@ -359,7 +408,7 @@ Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.valu
 
 - [ ] **Step 1: Failing tests** C-1191…C-1204 (render rows), C-1441…C-1450, C-0844, C-1359, C-1424. **Step 2–4.** **Step 5: Commit** `The record of advice, section by section, with the turn each fact came from`
 
-**Phase 6 gate.** `npm run grep-doc-css` and the print smoke green. Push.
+**Phase 6 gate.** `npm run grep-doc-css` and the print smoke green. Push; PR into `main`; merge when CI is green.
 
 ---
 
@@ -407,7 +456,7 @@ Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.valu
 
 - [ ] **Step 1: Failing tests** C-1553…C-1560, C-1069, C-1323, C-1545–C-1547. **Step 2–4.** **Step 5: Commit** `Count what the free tiers give us, and warn at 80%`
 
-**Phase 7 gate.** Push.
+**Phase 7 gate.** Push; PR into `main`; merge when CI is green.
 
 ---
 
@@ -461,7 +510,7 @@ Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.valu
 
 - [ ] **Step 1: Failing tests** C-0487, C-1466, C-1609, C-1538. **Step 2–4.** **Step 5: Commit** `The operator view`
 
-**Phase 8 gate.** Push.
+**Phase 8 gate.** Push; PR into `main`; merge when CI is green.
 
 ---
 
@@ -507,7 +556,7 @@ Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.valu
 
 - [ ] **Step 1: Failing tests** C-1349…C-1358, C-1347–C-1348 (app side), C-0981. **Step 2–4.** **Step 5: Commit** `A meeting lands in the same dashboard as a call`
 
-**Phase 10 gate.** Push.
+**Phase 10 gate.** Push; PR into `main`; merge when CI is green.
 
 ---
 
@@ -542,10 +591,26 @@ Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.valu
 - [ ] **Step 1: Failing tests** every `journey.e2e` row still untagged: C-0109–C-0115, C-0118–C-0119, C-0197–C-0198, C-0217–C-0222, C-0232–C-0233, C-0236, C-0239–C-0241, C-0252, C-0289–C-0291, C-0299, C-0355, C-0363, C-0470, C-0481–C-0483, C-0620, C-0753–C-0760, C-0794, C-0910, C-1352–C-1353 (meeting ones already), plus timing `[C-0006][C-0403]` assertions.
 - [ ] **Step 2–4.** **Step 5: Commit** `The whole call, from the first webhook byte to the delivery row`
 
+### Task 12.1b: Simulate a whole call locally and drive the dashboard in Chromium
+
+The founder is never asked to test (A19). This task is how Claude tests the real thing itself.
+
+**Files:** Create `scripts/dev-server.ts` (a plain `node:http` server mounting every `api/*.ts` handler at its Vercel path, against either the fakes (`--fake`, default) or a real Supabase when `SUPABASE_URL` is set), `scripts/simulate-call.ts` (plays a fixture as ElevenLabs would: POST `/api/voice/init`, the fixture's tool calls to `/api/voice/tool/*` at their timestamps, then signed `post_call_transcription` and `post_call_audio`; drains the worker; prints the session id and the `intel-trace` summary), `test/dashboard.browser.test.ts` (Playwright with the pre-installed Chromium — `require('playwright')`, `chromium.launch()`, no install: start the dev server, simulate the happy-path and misheard-age fixtures, log in with the code from the fake email outbox, open the call, tick facts, approve, assert the fake Resend received the email with the PDF, open the signed link, screenshot each page into `preview/` (git-ignored); skipped with a visible line when Chromium is absent).
+
+- [ ] **Step 1: Failing test** the browser test, tagged with the dashboard criteria it exercises end to end (`[C-1105][C-1139][C-1150][C-1000][C-1017][C-1582]`) in addition to their unit tests. **Step 2: Run** → FAIL. **Step 3: Implement.** **Step 4: Run** → PASS; look at the screenshots.
+- [ ] **Step 5: Commit** `Simulate a whole call locally and drive the dashboard in Chromium`
+
+### Task 12.5: Chase Intelligence export, trace reader, and the one-id proof
+
+**Files:** Create `api/_lib/intelexport.ts` (port; `EXPORT_TABLES` for Call: sessions, turns, consents, facts, fact_refusals, needs, recommendations, quotes, deliveries, hardship_notes, callbacks, client_messages, meeting_chunks (metadata only), recordings (metadata only), safety_events, usage_ledger, audit_log, jobs, incidents, webhook_events (without `raw` signatures), products, product_pricing, product_categories, disclosures, model_config; never login_codes, sessions_auth, broker_users.email), `scripts/intel-export.ts`, `scripts/intel-trace.ts`, `test/intel-trace.e2e.test.ts`, `test/intel-export.test.ts`. Update `docs/INTEL-PHASE0.md` with anything learned while building.
+
+- [ ] **Step 1: Failing tests** C-1755 (the happy-path call reads back whole, in order, from the session id), C-1756 (capture off vs on changes nothing), C-1757 (`npm run test:intel` counts equal `npm test`), C-1759–C-1762, C-1710 (end-to-end form).
+- [ ] **Step 2–4.** **Step 5: Commit** `Export everything, read any task back from one id`
+
 ### Task 12.2: Criteria closure
 
 - [ ] **Step 1:** `npm run criteria -- --missing`. For every remaining id: either add the test to the owning file (one executor per owning file, parallel-safe), or, if the criterion is wrong or duplicative, edit the row with a reason in the commit and note it in BEHAVIOR-MATRIX Part B.
-- [ ] **Step 2:** Add `npm run criteria -- --check --matrix` to `verify` (it is already in CI; confirm it now passes).
+- [ ] **Step 2:** Switch CI's criteria step from `--count --matrix` to `--check --matrix` (it is already in `verify`); confirm it passes.
 - [ ] **Step 3:** `npm run verify` → all green; paste the counts in the PR.
 - [ ] **Step 4: Commit** `Every criterion tagged; verify green`
 
@@ -555,11 +620,12 @@ Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.valu
 
 - [ ] **Step 1:** Write. **Step 2:** The orchestrator walks the demo script against the e2e fixtures. **Step 3: Commit** `Handoff: the demo, step by step`
 
-### Task 12.4: Drift audit and the PR
+### Task 12.4: Drift audit, merge, and the reply
 
 - [ ] **Step 1:** Phase reviewer agent reads the branch against BEHAVIOR-MATRIX Part A, SPEC §0, Part B; lists drift; orchestrator fixes.
-- [ ] **Step 2:** Open the PR against `main` with: what changed, the verify counts (tests, criteria tagged, grep results, print smoke), the founder's steps (keys to set, accounts to create, what costs money and is waiting for a yes), one tester prompt covering call-in, in-person and the dashboard.
-- [ ] **Step 3:** Reply briefly in chat (BEHAVIOR-MATRIX A19).
+- [ ] **Step 2:** Run `npm run verify` and `npm run simulate-call -- happy-path` one last time and paste the counts and the trace summary into the final PR: what changed, the verify counts (tests in both modes, criteria tagged of total, grep results, print smoke, browser test), and the founder's steps (keys to set, accounts to create, what costs money and is waiting for a yes). No tester prompt.
+- [ ] **Step 3:** Merge the final PR into `main` once CI is green. Confirm `main` holds every phase (`git log origin/main --oneline | head`).
+- [ ] **Step 4:** Reply briefly in chat (BEHAVIOR-MATRIX A19): what was built, the merged PR links, the counts, and only the steps that need the founder's hands.
 
 ---
 
@@ -568,4 +634,5 @@ Columns exactly as SPEC §4 plus: `facts.approx bool default false`, `facts.valu
 - **Spec coverage:** SPEC §3.1 steps 1–10 → Tasks 3.1–3.4, 4.2, 5.x, 6.x, 7.x, 8.3; §3.2 → Phase 10; §3.3 → 2.4, 3.2, 5.1, 7.5; §3.4 → 3.4, 7.5; §4 → 1.1; §5 → 9.1; §6 → 4.3, 4.4; §7.1–7.9 → 3.4, 2.2, 2.3/4.2, 5.1, 2.4, 5.3, 6.1, 6.2, 7.5; §8 → 5.x; §9 → 6.3, 6.4, 8.4; §10 → Phase 8; §11 → 7.1–7.4; §12 → Phase 11, 7.6; §13 → 0.2, 0.5, 1.1, 7.4, 8.1; §14 → 0.1, 4.1, 12.1, 12.2; §15 nothing to build.
 - **Type consistency:** `Fact`/`FactDraft` (Task 2.3) are what `needsFrom` (5.1), `selectProduct` (5.3), `allowedNumbers` (6.1), `checkQuoteText` (6.2), `quoteDocHTML` (6.3), `roaHTML` (6.5) consume; `Selection` (5.3) is what `runMatch` writes and `versions.ts` (8.4) re-creates; `approveQuote`/`transition` (7.3) are the only writers of `quotes.status` besides `checkQuote` via `advanceAfterCheck` (6.2 stub → 7.3 real).
 - **Review Focus tests** are assigned: 1 → 2.1, 2 → 3.5, 3 → 2.3, 4 → 8.3, 5 → 7.3.
+- **Chase Intelligence** is covered task by task by the Capture map; nothing is retrofitted at the end except the export and the end-to-end proof (12.5).
 - **Proportion:** the plan names files, signatures, criteria ranges and commit messages, and leaves bodies to the executor; the criteria files carry the assertions so the plan does not repeat them.

@@ -18,7 +18,9 @@ implementation plan. Start at `CLAUDE.md`.
 | `docs/AGENT-PROMPT.md` | The voice agent's prompt, pushed to ElevenLabs from the repo |
 | `docs/RESEARCH.md` | How the problem is solved elsewhere, the free stack's real limits, the regulatory shape, cost per call |
 | `docs/superpowers/plans/2026-10-31-call-build.md` | The implementation plan: phases, tasks, TDD steps, for execution agents |
-| `criteria/` | 1,264 acceptance criteria; `npm run criteria -- --check` proves each is tagged in a test |
+| `criteria/` | 1,337 acceptance criteria; `npm run criteria -- --check` proves each is tagged in a test |
+| `docs/BUILD-PROMPT.md` | The prompt that starts the build in a new chat |
+| `docs/INTEL-CONTRACT.md`, `docs/INTEL-PHASE0.md` | Chase Intelligence v1: every task recorded whole under one id |
 | `scripts/` | `criteria.ts`, the CI greps, the TypeScript loader |
 
 ## The shape of the code (once built)

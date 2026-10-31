@@ -22,9 +22,10 @@ posture and it is not negotiable (`docs/RESEARCH.md` §4).
 2. `docs/SPEC.md` — the design: rules R1–R15, journeys, data model, pipeline, matching, the document, the dashboard, in-person, ops, security, testing.
 3. `docs/AGENT-PROMPT.md` — the voice agent's prompt, which is also a spec.
 4. `docs/superpowers/plans/2026-10-31-call-build.md` — the implementation plan, task by task, TDD, for execution agents.
-5. `criteria/README.md` and `criteria/*.md` — the 1,264 acceptance criteria. Every one is tagged in a test before the work is done.
-6. `docs/RESEARCH.md` — why these choices; what still says **verify**.
-7. `../charlie` — the reference implementation this ports from. Read `charlie/CLAUDE.md`'s ten rules; they hold here as SPEC R1–R15.
+5. `criteria/README.md` and `criteria/*.md` — the 1,337 acceptance criteria. Every one is tagged in a test before the work is done.
+6. `docs/INTEL-CONTRACT.md` and `docs/INTEL-PHASE0.md` — Chase Intelligence: every task recorded whole under one id. Built in from Task 0.6, not retrofitted.
+7. `docs/RESEARCH.md` — why these choices; what still says **verify**.
+8. `../charlie` — the reference implementation this ports from. Read `charlie/CLAUDE.md`'s ten rules; they hold here as SPEC R1–R15.
 
 ## Stack (free tier of each; see RESEARCH §3)
 
@@ -42,8 +43,11 @@ Jev optional for guardrails with the model backstop.
 - **Criteria tags in test names**: `test("[C-0412][C-0413] …")`. `npm run criteria -- --check` must pass before a phase is called done.
 - **`npm run verify`** = `typecheck` + `test` + `criteria --check` + `grep-models` + `grep-doc-css` + `preview-quote` smoke.
 - **Port from Charlie** with attribution in the file header and the "why" comments kept.
-- **Ask before money, production numbers, Meta verification, real client data.** Everything else: build it.
-- **Reply briefly.** What changed, the PR link, the verify counts, the founder's steps, one tester prompt.
+- **Capture everything** (Chase Intelligence v1, BEHAVIOR-MATRIX A21): every task that adds an entry point, a model call, a check, a tool, a send, a job or a person action adds its `capture()` call and asserts it.
+- **Merge it yourself when it is green** (A13): one PR per phase into `main`, merged as soon as verify and CI pass. Create `main` from the planning commit if it does not exist.
+- **Test it yourself; never ask the founder to** (A19): the suite, the simulated call, the dashboard in Chromium, print-to-PDF.
+- **Decide, don't stall** (A22). Ask only before money, production numbers, Meta verification, real client data. Everything else: build it.
+- **Reply briefly.** What was built, the merged PR links, the verify counts, and only the steps that need the founder's hands.
 
 ## Running it
 
@@ -61,5 +65,7 @@ node --experimental-strip-types --import ./scripts/register-ts.mjs scripts/previ
 - A verified phone number (or the `/demo` widget) where Mike or the distributor completes consent → fact-find → read-back → channel, and within 3 minutes the broker dashboard shows the call, the sourced facts, one recommendation per need, and the quotation; one tap sends it by email (WhatsApp once the template is approved); the client receives a PDF that prints cleanly.
 - The in-person page records a meeting and lands in the same dashboard.
 - `/app/costs` shows the real cost of each call.
-- `npm run verify` green: every test, every criterion tagged, no model slug in `api/`, no grid/flex/var() in a document, PDF smoke passing.
+- `npm run verify` green: every test (with capture off and on), every criterion tagged, no model slug in `api/`, no grid/flex/var() in a document, PDF smoke passing.
+- `npm run intel-trace -- <session id>` reads a whole simulated call back in order: asked, seen, decided, checked, approved, sent, delivered.
+- Everything merged into `main`.
 - `HANDOFF.md` lists what cannot be ticked from inside a repository (a live number, a stranger completing the flow, template approval) and how the founder ticks it.

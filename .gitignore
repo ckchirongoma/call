@@ -17,3 +17,6 @@ supabase/.temp/
 
 # eval.ts dry runs write here; results are not source.
 eval/results-*.json
+
+# Chase Intelligence exports are data, never source (docs/INTEL-CONTRACT.md §4.7).
+intel-export/

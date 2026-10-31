@@ -20,6 +20,7 @@ Columns: `id | area | journey | criterion (given / when / then) | owning test fi
 | `10-meeting.md` | In-person mode | C-1300–C-1360 |
 | `11-compliance.md` | Retention, forget, consent, minimality, record of advice, safety events | C-1400–C-1470 |
 | `12-ops-security.md` | Model layer, health, alerts, limits, cron, RLS, links, webhooks, jobs | C-1500–C-1610 |
+| `13-intel.md` | Chase Intelligence: capture, ids, kinds, redaction, consent, forgetting, read-back, export | C-1700–C-1770 |
 
 Writing a new criterion: pick the next free id in the file's range (ranges
 have gaps on purpose), one observable behaviour per row, phrased so a test

@@ -14,7 +14,11 @@
     "grep-doc-css": "bash scripts/grep-doc-css.sh",
     "preview-quote": "node --experimental-strip-types --import ./scripts/register-ts.mjs scripts/preview-quote.mjs",
     "push-agent": "node --experimental-strip-types --import ./scripts/register-ts.mjs scripts/push-agent.ts",
-    "verify": "npm run typecheck && npm test && npm run criteria -- --check && npm run grep-models && npm run grep-doc-css && npm run preview-quote -- --smoke"
+    "verify": "npm run typecheck && npm test && npm run test:intel && npm run criteria -- --check --matrix && npm run grep-models && npm run grep-doc-css && npm run preview-quote -- --smoke",
+    "test:intel": "TRACKING_OFF=1 INTEL_CAPTURE=full node --experimental-strip-types --import ./scripts/register-ts.mjs --test \"test/**/*.test.ts\"",
+    "intel-export": "node --experimental-strip-types --import ./scripts/register-ts.mjs scripts/intel-export.ts",
+    "intel-trace": "node --experimental-strip-types --import ./scripts/register-ts.mjs scripts/intel-trace.ts",
+    "simulate-call": "node --experimental-strip-types --import ./scripts/register-ts.mjs scripts/simulate-call.ts"
   },
   "dependencies": {
     "@sparticuz/chromium": "147.0.0",
