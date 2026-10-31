@@ -83,6 +83,12 @@ function snapshot() {
     WHATSAPP_TEMPLATE_QUOTE_READY: read("WHATSAPP_TEMPLATE_QUOTE_READY") || "quote_ready",
     WHATSAPP_TEMPLATE_BROKER_NEW_QUOTE: read("WHATSAPP_TEMPLATE_BROKER_NEW_QUOTE") || "broker_new_quote",
 
+    // ── Transcription, direct (optional) ─────────────────────────
+    /** Only when the `voice` row's provider is groq. The default route is OpenRouter's, on OPENROUTER_API_KEY. */
+    GROQ_API_KEY: read("GROQ_API_KEY"),
+    /** Only when the `voice` row's provider is openai. */
+    OPENAI_API_KEY: read("OPENAI_API_KEY"),
+
     // ── Guardrail engine (optional) ──────────────────────────────
     /** Jev. Absent → the `safety` and `checker` rows in model_config run the same checks; /api/health says which. */
     TYPESAFE_API_KEY: read("TYPESAFE_API_KEY"),

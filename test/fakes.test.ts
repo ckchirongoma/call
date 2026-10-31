@@ -16,6 +16,7 @@ import {
   fakeStorage,
   installFakeDb,
   installFakeNet,
+  modelReply,
   type FakeDb,
   type FakeNet,
 } from "./_fakes.ts";
@@ -378,6 +379,77 @@ describe("fake database", () => {
       assert.equal((await db().from("jobs").insert(job({}))).error, null);
       assert.equal((await db().from("jobs").insert(job({}))).error, null);
     });
+  });
+
+  describe('rpc("bump_incident")', () => {
+    const bump = (p_fingerprint: string, p_severity: string, p_summary: string, p_kind = "model_call_failed") =>
+      db().rpc("bump_incident", { p_fingerprint, p_kind, p_severity, p_summary });
+
+    test("one row per fingerprint: a repeat counts, moves last_at, keeps the worst severity and the latest summary", async () => {
+      const clock = fakeClock("2026-10-31T08:00:00.000Z");
+      try {
+        const first = await bump("model_call_failed:extract:rate", "warn", "first");
+        assert.deepEqual({ data: first.data, error: first.error }, { data: null, error: null });
+        clock.advance(60_000);
+        await bump("model_call_failed:extract:rate", "error", "second");
+        await bump("model_call_failed:extract:rate", "info", "third");
+        await bump("openrouter_credential", "critical", "the key was refused", "openrouter_credential");
+
+        const [one, two] = fake.tables.incidents;
+        assert.equal(fake.tables.incidents.length, 2);
+        assert.equal(one!.kind, "model_call_failed");
+        assert.equal(one!.count, 3);
+        assert.equal(one!.severity, "error", "an info repeat never downgrades an error");
+        assert.equal(one!.summary, "third");
+        assert.equal(one!.first_at, "2026-10-31T08:00:00.000Z");
+        assert.equal(one!.last_at, "2026-10-31T08:01:00.000Z");
+        assert.equal(two!.count, 1);
+        assert.equal(two!.severity, "critical");
+        assert.deepEqual(fake.log.filter((q) => q.op === "rpc").map((q) => q.fn), ["bump_incident", "bump_incident", "bump_incident", "bump_incident"]);
+      } finally {
+        clock.restore();
+      }
+    });
+
+    test("it takes exactly its four text arguments, a severity outside the four is a check violation, and fingerprint is unique", async () => {
+      // A misspelt or missing argument is PGRST202 in production.
+      refused(() => db().rpc("bump_incident", { p_fingerprint: "x", p_kind: "k", p_severity: "warn" }), /p_fingerprint, p_kind, p_severity, p_summary/);
+      refused(() => db().rpc("bump_incident", { p_fingerprint: "x", p_kind: "k", p_severity: "warn", p_summary: "s", p_alert: "digest" }), /p_alert/);
+      refused(() => db().rpc("bump_incident", { p_fingerprint: null, p_kind: "k", p_severity: "warn", p_summary: "s" }), /text/);
+      const loud = await bump("x", "loud", "s");
+      assert.equal(loud.error?.code, "23514");
+      assert.equal(fake.tables.incidents.length, 0);
+      // A summary is cut to 500 characters, as the SQL's left(p_summary, 500).
+      await bump("long", "warn", "y".repeat(600));
+      assert.equal(String(fake.tables.incidents[0]!.summary).length, 500);
+      // The fingerprint is the arbiter, so a direct insert of a second row for it is refused.
+      const dup = await db().from("incidents").insert({ kind: "k", severity: "warn", summary: "", fingerprint: "long" });
+      assert.equal(dup.error?.code, "23505");
+    });
+  });
+
+  test("failTable(name) makes every query on that table answer with an error until failTable(name, null)", async () => {
+    await addBroker();
+    fake.failTable("model_config");
+    const read = await db().from("model_config").select("role, model").eq("role", "extract").maybeSingle();
+    assert.equal(read.data, null);
+    assert.equal(read.error?.code, "42P01");
+    assert.match(read.error!.message, /model_config/);
+    const write = await db().from("model_config").insert({ role: "extract", provider: "openrouter", model: "demo/model" });
+    assert.equal(write.error?.code, "42P01");
+    assert.equal(fake.tables.model_config.length, 0, "nothing was written");
+    // Other tables are untouched, and the query is still logged.
+    assert.equal(rowsOf(await db().from("brokers").select("id")).length, 1);
+    assert.equal(fake.log.filter((q) => q.table === "model_config").length, 2);
+
+    fake.failTable("brokers", { code: "57014", message: "canceling statement due to statement timeout" });
+    assert.equal((await db().from("brokers").select("id")).error?.code, "57014");
+
+    fake.failTable("model_config", null);
+    assert.equal((await db().from("model_config").select("role")).error, null);
+    // reset() clears every switch.
+    fake.reset();
+    assert.equal((await db().from("brokers").select("id")).error, null);
   });
 });
 
@@ -790,6 +862,23 @@ describe("fake network", () => {
     net.onModel(/BOOM/, () => new Response("upstream down", { status: 503 }));
     const res = await chat("BOOM");
     assert.equal(res.status, 503);
+  });
+
+  test("modelReply() is an OpenRouter chat reply with the finish_reason and usage a test asks for (a truncation, say)", async () => {
+    net.onModel(/CUT/, () => modelReply('{"facts": [', { finishReason: "length", usage: { prompt_tokens: 700, completion_tokens: 1200 } }));
+    net.onModel(/OBJ/, () => modelReply({ a: 1 }));
+    const cut = await (await chat("CUT")).json();
+    assert.equal(cut.choices[0].finish_reason, "length");
+    assert.equal(cut.choices[0].message.content, '{"facts": [');
+    assert.deepEqual(cut.usage, { prompt_tokens: 700, completion_tokens: 1200, total_tokens: 1900 });
+    const obj = await (await chat("OBJ")).json();
+    // The defaults are the ones a plain onModel answer has.
+    assert.equal(obj.choices[0].finish_reason, "stop");
+    assert.equal(obj.choices[0].message.content, '{"a":1}');
+    assert.deepEqual(obj.usage, { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 });
+    // A null finish_reason is sent as null (a stream cut off upstream reads that way).
+    net.onModel(/NULL/, () => modelReply("partial", { finishReason: null }));
+    assert.equal((await (await chat("NULL")).json()).choices[0].finish_reason, null);
   });
 
   test("a model call nobody scripted fails loudly instead of answering", async () => {

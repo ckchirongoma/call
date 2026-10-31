@@ -50,6 +50,10 @@ export const TEST_ENV: Readonly<Record<string, string | undefined>> = {
   WHATSAPP_TEMPLATE_QUOTE_READY: undefined,
   WHATSAPP_TEMPLATE_BROKER_NEW_QUOTE: undefined,
 
+  // Obvious fakes, so the direct transcription routes can be tested (models.test.ts).
+  GROQ_API_KEY: "test-groq-key",
+  OPENAI_API_KEY: "test-openai-key",
+
   // Unset on purpose: with no Jev key the guardrails fall through to the model
   // backstop, which is the configuration most deployments run (SPEC R13).
   TYPESAFE_API_KEY: undefined,

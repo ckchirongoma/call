@@ -40,7 +40,10 @@
 // CHECK constraints, joins.
 //
 // Several tasks extend this file (0.3 finish_reason, 0.6 the intel_events
-// missing-table switch); add the shape you need and keep the throw.
+// missing-table switch); add the shape you need and keep the throw. Task 0.3
+// added modelReply() (a chat reply with any finish_reason and usage), the
+// bump_incident rpc (track.ts counts incidents through it), and failTable() (a
+// table that answers every query with an error: "model_config is unreadable").
 
 // Must be first: api/_lib/env.ts snapshots process.env when it is first imported,
 // and importing the fakes imports api/_lib/db.ts which imports it.
@@ -211,6 +214,8 @@ const UNIQUE: Partial<Record<TableName, string[][]>> = {
   turns: [["session_id", "idx"]],
   webhook_events: [["provider", "external_id", "event_type"]],
   jobs: [["dedupe_key"]],
+  // bump_incident's arbiter: one row per distinct problem (Charlie db/0024 made it the primary key).
+  incidents: [["fingerprint"]],
   intel_events: [["source_ref"]],
 };
 
@@ -532,7 +537,14 @@ export interface FakeDb {
   /** Every query run, in order. */
   log: QueryLog[];
   storage: FakeStorage;
-  /** Empty every table, the log and Storage. */
+  /**
+   * Make every query on `table` answer with `error` (default 42P01, the table
+   * does not exist) instead of running, until failTable(table, null). The query
+   * is still logged. For "the table is unreadable" (model_config, C-1523) and,
+   * later, "intel_events is missing" (Task 0.6).
+   */
+  failTable(table: TableName, error?: { code: string; message: string } | null): void;
+  /** Empty every table, the log and Storage, and clear every failTable() switch. */
   reset(): void;
   /** Take this client back out of db(). */
   uninstall(): void;
@@ -550,6 +562,8 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
   const tables = Object.fromEntries(TABLES.map((t) => [t, [] as Row[]])) as Record<TableName, Row[]>;
   const log: QueryLog[] = [];
   const storage = fakeStorage();
+  /** failTable() switches: a table here answers every query with its error. */
+  const failing = new Map<TableName, PgError>();
 
   // Ids are per database, so every test starts at 1 and ids in a failure message are stable.
   let uuidCounter = 0;
@@ -734,6 +748,12 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
 
     const settle = (): Result => {
       const kind = op ?? "select";
+
+      const broken = failing.get(t);
+      if (broken) {
+        logEntry(kind);
+        return fail(broken, broken.code === "42P01" ? 404 : 500);
+      }
 
       if (kind === "select") {
         logEntry("select");
@@ -936,14 +956,54 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
     return [structuredClone(job)];
   };
 
+  const SEVERITIES = ["info", "warn", "error", "critical"];
+
+  /**
+   * bump_incident(p_fingerprint, p_kind, p_severity, p_summary): one atomic
+   * upsert-and-count per distinct problem, as Charlie's db/0024, on Call's
+   * incidents columns. A new fingerprint is a row with count 1; a repeat adds
+   * one, moves last_at, keeps the worst severity it has ever had (one critical
+   * repeat is never downgraded) and the latest summary. The summary is cut to
+   * 500 characters, as the SQL's left(p_summary, 500). Returns void (data null).
+   * Task 0.4 / 1.1 own the real function and update this when it differs.
+   */
+  const bumpIncident = (args: Record<string, unknown>): Result => {
+    const severity = String(args.p_severity);
+    if (!SEVERITIES.includes(severity)) {
+      return fail(pgError("23514", `new row for relation "incidents" violates check constraint "incidents_severity_check"`), 400);
+    }
+    const summary = String(args.p_summary).slice(0, 500);
+    const now = new Date().toISOString();
+    const existing = tables.incidents.find((r) => r.fingerprint === args.p_fingerprint);
+    if (existing) {
+      existing.count = (existing.count ?? 0) + 1;
+      existing.last_at = now;
+      if (SEVERITIES.indexOf(severity) > SEVERITIES.indexOf(existing.severity)) existing.severity = severity;
+      existing.summary = summary;
+      return ok(null);
+    }
+    const res = insertRows("incidents", [{ kind: args.p_kind, severity, summary, fingerprint: args.p_fingerprint, first_at: now, last_at: now, count: 1 }], true);
+    return "error" in res ? fail(res.error, res.status) : ok(null);
+  };
+
+  /** Each faked function, with its exact parameter list (PostgREST answers PGRST202 for any other) and whether every one is text. */
+  const RPCS: Record<string, { params: string[]; text: boolean; run: (args: Record<string, unknown>) => Result | Row[] }> = {
+    claim_job: { params: ["p_worker"], text: false, run: claimJob },
+    bump_incident: { params: ["p_fingerprint", "p_kind", "p_severity", "p_summary"], text: true, run: bumpIncident },
+  };
+
   /** A builder, like supabase-js's: nothing runs until it is awaited, and single()/maybeSingle() shape the rows. */
   const rpc = (fn: string, args: Record<string, unknown> = {}, opts?: Record<string, unknown>) => {
-    if (fn !== "claim_job") throw new FakeDbUnsupported(`rpc("${fn}")`);
+    const def = RPCS[fn];
+    if (!def) throw new FakeDbUnsupported(`rpc("${fn}")`);
     const shape = `rpc(${show([fn, args])})`;
     onlyOptions(shape, opts, []);
     const params = Object.keys(args);
-    if (params.length !== 1 || params[0] !== "p_worker") {
-      throw new FakeDbUnsupported(`${shape}: claim_job takes exactly (p_worker); PostgREST answers PGRST202 for any other arguments`);
+    if (params.length !== def.params.length || !def.params.every((p) => params.includes(p))) {
+      throw new FakeDbUnsupported(`${shape}: ${fn} takes exactly (${def.params.join(", ")}); PostgREST answers PGRST202 for any other arguments`);
+    }
+    if (def.text && !def.params.every((p) => typeof args[p] === "string")) {
+      throw new FakeDbUnsupported(`${shape}: every argument of ${fn} is text (a null or a number here is a bug at the call site)`);
     }
     let mode: Mode = "many";
     const api = {
@@ -958,7 +1018,8 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
       then(resolve: (v: unknown) => unknown, reject?: (e: unknown) => unknown) {
         try {
           log.push({ table: "", op: "rpc", filters: [], fn, args: wire(args) });
-          return Promise.resolve(finish(claimJob(args), null, mode)).then(resolve, reject);
+          const out = def.run(args);
+          return Promise.resolve(Array.isArray(out) ? finish(out, null, mode) : out).then(resolve, reject);
         } catch (err) {
           return Promise.reject(err).then(resolve, reject);
         }
@@ -989,9 +1050,15 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
     tables,
     log,
     storage,
+    failTable(table, error) {
+      if (!TABLE_SET.has(table)) throw new FakeDbUnsupported(`failTable("${table}") (not a Call table)`);
+      if (error === null) failing.delete(table);
+      else failing.set(table, pgError(error?.code ?? "42P01", error?.message ?? `relation "public.${table}" does not exist`));
+    },
     reset() {
       for (const t of TABLES) tables[t].length = 0;
       log.length = 0;
+      failing.clear();
       storage.files.clear();
       storage.contentTypes.clear();
     },
@@ -1217,7 +1284,8 @@ export interface FakeNet {
   /**
    * Answer a chat call whose prompt (all messages joined) matches. `respond`
    * returns the message content (an object is JSON-stringified), or a
-   * Response, which is sent as-is: an error status, a truncated body. It may be
+   * Response, which is sent as-is: an error status, a truncated body, or
+   * modelReply(content, { finishReason, usage }). It may be
    * async, and is given the request's init (its abort signal, say). First
    * registered match wins. No match throws, so an unscripted model call fails
    * the test instead of inventing an answer.
@@ -1236,6 +1304,39 @@ export interface FakeNet {
 
 export const jsonResponse = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+
+export interface ModelReplyOptions {
+  /** "stop" unless given. "length" is a truncation (C-1500); null is a stream that ended without saying why. */
+  finishReason?: string | null;
+  usage?: { prompt_tokens: number; completion_tokens: number };
+  /** The model the reply says answered (OpenRouter echoes the slug). Omitted unless given. */
+  model?: string;
+  id?: string;
+}
+
+/** The body of an OpenRouter chat completion: `content` as the message (an object is JSON-stringified). */
+function chatBody(content: unknown, opts: ModelReplyOptions = {}): Record<string, unknown> {
+  const usage = opts.usage ?? { prompt_tokens: 10, completion_tokens: 10 };
+  return {
+    id: opts.id ?? "gen-test",
+    ...(opts.model !== undefined ? { model: opts.model } : {}),
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: typeof content === "string" ? content : JSON.stringify(content) },
+        finish_reason: opts.finishReason === undefined ? "stop" : opts.finishReason,
+      },
+    ],
+    usage: { ...usage, total_tokens: usage.prompt_tokens + usage.completion_tokens },
+  };
+}
+
+/**
+ * A chat reply an onModel responder can return when "stop" with 10/10 tokens
+ * will not do: a truncation (`finishReason: "length"`), a reply that spent a
+ * given number of tokens (the usage ledger), or both.
+ */
+export const modelReply = (content: unknown, opts: ModelReplyOptions = {}): Response => jsonResponse(chatBody(content, opts));
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 /** A private copy without the g flag: the caller's RegExp is never shared or advanced. */
@@ -1331,14 +1432,7 @@ export function installFakeNet(): FakeNet {
       if (!hit) throw new Error(`fake net: no scripted model response for prompt starting:\n${prompt.slice(0, 300)}`);
       const content = await hit.respond(prompt, init);
       if (content instanceof Response) return content;
-      return jsonResponse({
-        id: `gen-test-${modelCalls.length}`,
-        model: payload.model,
-        choices: [
-          { index: 0, message: { role: "assistant", content: typeof content === "string" ? content : JSON.stringify(content) }, finish_reason: "stop" },
-        ],
-        usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
-      });
+      return jsonResponse(chatBody(content, { id: `gen-test-${modelCalls.length}`, model: payload.model }));
     }
 
     // Anything else in a test is a mistake worth failing on.
