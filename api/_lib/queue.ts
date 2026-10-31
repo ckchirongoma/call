@@ -49,11 +49,17 @@
 //   - Nothing fails silently. A claim that fails, a job whose outcome cannot be
 //     written and a hand-on that cannot read the queue are incidents, and the
 //     drain's report says ok: false (the worker answers 500).
+//   - Every job is recorded whole (Chase Intelligence, intel.ts; C-1713,
+//     C-1732): a `job` row when it is enqueued (in the trace that queued it,
+//     with meta.job_id), and when an attempt starts, finishes, fails, is held,
+//     skipped or fenced (in the job's own trace: its session's `s_<id>` when it
+//     has a session, else `job_<id>`), each with its payload.
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { db } from "./db.js";
 import { env } from "./env.js";
+import { capture } from "./intel.js";
 import { DeadlineError, JobFencedError, JobHoldError, jobCtx, type JobCtx } from "./jobctx.js";
 import type { Job } from "./types.js";
 import { cutSafe, errorText, flushTracking, since, track, trackFailure, trackingOff, withTrackContext, type TrackOptions } from "./track.js";
@@ -190,6 +196,33 @@ export function __setSleep(fn: (ms: number) => Promise<void>): () => void {
   };
 }
 
+// ── The record (Chase Intelligence) ──────────────────────────────
+
+/** A job's life, as the `job` rows name it: `job_<event>`. */
+export type JobEvent = "enqueued" | "started" | "finished" | "failed" | "held" | "skipped" | "fenced" | "cancelled";
+
+/**
+ * One `job` row (intel.ts, C-1732): the job's id, kind, attempt and payload,
+ * in the trace of the code that calls it — the enqueuer's for "enqueued", the
+ * job's own for the rest. Exported for the one step of a job's life the queue
+ * does not take itself: forgetClient() cancelling a forgotten client's queued
+ * jobs (Tasks 3.4, 8.7) records each as "cancelled" here. Never throws.
+ */
+export function captureJob(
+  event: JobEvent,
+  job: { id: number | string; kind: string; attempts?: number; payload?: unknown },
+  more: { ok?: boolean | null; ms?: number; meta?: Record<string, unknown> } = {},
+): void {
+  capture("job", {
+    name: `job_${event}`,
+    ok: more.ok ?? null,
+    ms: more.ms ?? null,
+    content: { payload: job.payload ?? {} },
+    // jobs.id is a bigint identity: the contract's job_id is a number (C-1713).
+    meta: { job_id: Number(job.id), kind: job.kind, attempt: job.attempts ?? 0, ...(more.meta ?? {}) },
+  });
+}
+
 // ── Enqueueing ───────────────────────────────────────────────────
 
 export interface EnqueueOptions {
@@ -226,8 +259,16 @@ export async function enqueue(kind: JobKind, sessionId: string | null, payload: 
     })
     .select("id")
     .single();
-  if (!error) return String((data as { id: number }).id);
-  if (opts.dedupeKey && (error as { code?: string }).code === "23505") return sameWork(opts.dedupeKey, stored, runAfter);
+  if (!error) {
+    const id = (data as { id: number }).id;
+    captureJob("enqueued", { id, kind, attempts: 0, payload: stored }, { meta: { run_after: runAfter, dedupe: Boolean(opts.dedupeKey) } });
+    return String(id);
+  }
+  if (opts.dedupeKey && (error as { code?: string }).code === "23505") {
+    const id = await sameWork(opts.dedupeKey, stored, runAfter);
+    captureJob("enqueued", { id, kind, attempts: 0, payload: stored }, { meta: { run_after: runAfter, dedupe: true, existing: true } });
+    return id;
+  }
   throw new Error(`enqueue ${kind} failed: ${errorText(error)}`);
 }
 
@@ -836,8 +877,11 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
   const context = { sessionId: job.session_id, jobId: job.id, channel: "system" as const, traceId: job.session_id ? `s_${job.session_id}` : `job_${job.id}` };
 
   await withTrackContext(context, async () => {
-    // Task 0.6: capture job lifecycle
     const startedAt = Date.now();
+    const fenced = (): void => {
+      report.fenced++;
+      captureJob("fenced", job);
+    };
 
     // claim_job reclaimed a job whose worker died on its last attempt (the
     // platform killed it, so nothing recorded a failure). Running it a fourth
@@ -846,6 +890,7 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
       const message = `the worker stopped during the last attempt (no heartbeat for ${LOCK_TIMEOUT_MS / 1000} s)`;
       if (await finishJob(job.id, "failed", message, worker)) {
         report.failed++;
+        captureJob("failed", job, { ok: false, meta: { final: true, reason: "worker_died", error: message } });
         trackFailure("job_failed", message, {
           severity: "error",
           alert: "immediate",
@@ -853,7 +898,7 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
           fingerprint: `job_failed:${job.kind}`,
           summary: `${what} failed ${MAX_ATTEMPTS} times and gave up${sessionRef ? ` (session ${sessionRef})` : ""}: ${message}`,
         });
-      } else report.fenced++;
+      } else fenced();
       return;
     }
 
@@ -864,6 +909,7 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
       const message = `unknown_kind: no handler for "${job.kind}" in this worker`;
       if (await finishJob(job.id, "failed", message, worker)) {
         report.failed++;
+        captureJob("failed", job, { ok: false, meta: { final: true, reason: "unknown_kind", error: message } });
         trackFailure("unknown_kind", message, {
           severity: "error",
           alert: "immediate",
@@ -871,7 +917,7 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
           fingerprint: `unknown_kind:${job.kind}`.slice(0, 200),
           summary: `A "${job.kind}" job reached a worker with no handler for it and was marked failed (is its module imported in api/worker.ts?)`,
         });
-      } else report.fenced++;
+      } else fenced();
       return;
     }
 
@@ -879,8 +925,9 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
     if (job.session_id && (await otherJobRunningFor(job.session_id, job.id))) {
       if (await holdJob(job.id, job.attempts, "another job of this session is still running", HOLD_MS, worker)) {
         report.held++;
+        captureJob("held", job, { meta: { reason: "session_busy", delay_ms: HOLD_MS } });
         track("job_held", { category: "performance", props: { ...facts, reason: "session_busy" } });
-      } else report.fenced++;
+      } else fenced();
       return;
     }
 
@@ -889,12 +936,12 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
     // reaches here is one whose session went between claim_job and this
     // check, or one that names its session only in its payload.
     if (await sessionGone(job)) {
-      // Task 0.6: capture job lifecycle (skipped: session gone)
       const settled = await finishJob(job.id, "skipped", "the session no longer exists (forgotten or deleted)", worker);
       if (settled || (await jobGone(job.id))) {
         report.skipped++;
+        captureJob("skipped", job, { meta: { reason: "session_gone" } });
         track("job_skipped", { category: "behaviour", props: { ...facts, reason: "session_gone" } });
-      } else report.fenced++;
+      } else fenced();
       return;
     }
 
@@ -931,20 +978,22 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
         ),
       heartbeatMs,
     );
+    captureJob("started", job, { meta: { max_attempts: MAX_ATTEMPTS, last_attempt: ctx.lastAttempt === true } });
     try {
       await jobCtx.run(ctx, () => handler(job, ctx));
       live = false;
       // The step returned, so its writes are committed: only now the steps after it.
       const queued = nextSteps.get(ctx) ?? [];
       if (queued.length && !(await stillOwnJob(job.id, worker))) {
-        report.fenced++;
+        fenced();
         return;
       }
       for (const n of queued) await enqueue(n.kind, n.sessionId, n.payload, n.opts);
       if (await finishJob(job.id, "done", null, worker)) {
         report.done++;
+        captureJob("finished", job, { ok: true, ms: since(startedAt) });
         track("job_done", { category: "performance", ms: since(startedAt), props: facts });
-      } else report.fenced++;
+      } else fenced();
     } catch (err) {
       live = false;
       await settleFailure(job, worker, err, report, { facts, sessionRef, what, startedAt });
@@ -970,24 +1019,29 @@ async function settleFailure(
   report: DrainReport,
   about: { facts: Record<string, unknown>; sessionRef: string | null; what: string; startedAt: number },
 ): Promise<void> {
+  const fenced = (): void => {
+    report.fenced++;
+    captureJob("fenced", job, { ms: since(about.startedAt) });
+  };
   if (err instanceof JobFencedError) {
     // Someone else owns the job now and will finish it: no retry, no status
     // write — this attempt simply stops.
     console.warn(err.message);
-    report.fenced++;
+    fenced();
     return;
   }
   // A stale attempt that failed some other way must not retry or fail a job another worker now owns.
   if (!(await stillOwnJob(job.id, worker).catch(() => true))) {
-    report.fenced++;
+    fenced();
     return;
   }
   // Not a failure: the job is waiting on other work (jobctx.ts JobHoldError).
   if (err instanceof JobHoldError) {
     if (await holdJob(job.id, job.attempts, err.message, err.delayMs, worker)) {
       report.held++;
+      captureJob("held", job, { ms: since(about.startedAt), meta: { reason: "hold", delay_ms: err.delayMs, why: err.message } });
       track("job_held", { category: "performance", props: { ...about.facts, ms_held: err.delayMs } });
-    } else report.fenced++;
+    } else fenced();
     return;
   }
   // Out of time (jobctx.ts DeadlineError, C-0493): not a failure, the first
@@ -999,18 +1053,20 @@ async function settleFailure(
   if (err instanceof DeadlineError && !/out of time/.test(job.last_error ?? "")) {
     if (await holdJob(job.id, job.attempts, err.message, 0, worker)) {
       report.held++;
+      captureJob("held", job, { ms: since(about.startedAt), meta: { reason: "out_of_time", delay_ms: 0 } });
       track("job_out_of_time", { category: "performance", ms: since(about.startedAt), props: about.facts });
-    } else report.fenced++;
+    } else fenced();
     return;
   }
 
   console.log(`job ${job.id} (${job.kind}) attempt ${job.attempts} failed:`, message);
   if (job.attempts >= MAX_ATTEMPTS) {
     if (!(await finishJob(job.id, "failed", message, worker))) {
-      report.fenced++;
+      fenced();
       return;
     }
     report.failed++;
+    captureJob("failed", job, { ok: false, ms: since(about.startedAt), meta: { final: true, error: message } });
     // Work a broker is waiting for that will not happen by itself: the email goes at once (alerts.ts, C-1541).
     trackFailure("job_failed", err, {
       severity: "error",
@@ -1022,10 +1078,11 @@ async function settleFailure(
     });
   } else {
     if (!(await scheduleRetry(job.id, job.attempts, message, worker))) {
-      report.fenced++;
+      fenced();
       return;
     }
     report.failed++;
+    captureJob("failed", job, { ok: false, ms: since(about.startedAt), meta: { final: false, retry_in_s: retryDelaySeconds(job.attempts), error: message } });
     trackFailure("job_retry", err, {
       severity: "warn",
       alert: "digest",

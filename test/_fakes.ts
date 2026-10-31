@@ -42,7 +42,7 @@
 // types and NOT NULL / CHECK constraints, joins.
 //
 // Several tasks extend this file (0.3 finish_reason, 0.6 the intel_events
-// missing-table switch); add the shape you need and keep the throw. Task 0.3
+// missing-table switch, missingTable()); add the shape you need and keep the throw. Task 0.3
 // added modelReply() (a chat reply with any finish_reason and usage), the
 // bump_incident rpc (track.ts counts incidents through it), and failTable() (a
 // table that answers every query with an error: "model_config is unreadable").
@@ -495,6 +495,9 @@ interface Result {
 
 type Mode = "many" | "single" | "maybe";
 
+/** A table that does not exist answers 404 (Postgres' 42P01, or PostgREST's own PGRST205); anything else failTable() sets, 500. */
+const statusFor = (error: PgError): number => (error.code === "42P01" || error.code === "PGRST205" ? 404 : 500);
+
 const ok = (data: Row[] | null, count: number | null = null): Result => ({ data, error: null, count, status: data === null ? 204 : 200, statusText: "OK" });
 const fail = (error: PgError, status = 409): Result => ({ data: null, error, count: null, status, statusText: "Error" });
 
@@ -551,6 +554,13 @@ export interface FakeDb {
    * later, "intel_events is missing" (Task 0.6).
    */
   failTable(table: TableName, error?: { code: string; message: string } | null): void;
+  /**
+   * The table does not exist yet, as PostgREST says it: PGRST205 "Could not
+   * find the table … in the schema cache", HTTP 404 (Postgres' own 42P01 is
+   * what failTable() gives by default). Undone by failTable(table, null) or
+   * reset(). For intel_events before its migration is applied (C-1758).
+   */
+  missingTable(table: TableName): void;
   /** Empty every table, the log and Storage, and clear every failTable() switch. */
   reset(): void;
   /** Take this client back out of db(). */
@@ -760,7 +770,7 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
       const broken = failing.get(t);
       if (broken) {
         logEntry(kind);
-        return fail(broken, broken.code === "42P01" ? 404 : 500);
+        return fail(broken, statusFor(broken));
       }
 
       if (kind === "select") {
@@ -1069,7 +1079,7 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
         try {
           log.push({ table: "", op: "rpc", filters: [], fn, args: wire(args) });
           const broken = failing.get(def.reads);
-          if (broken) return Promise.resolve(fail(broken, broken.code === "42P01" ? 404 : 500)).then(resolve, reject);
+          if (broken) return Promise.resolve(fail(broken, statusFor(broken))).then(resolve, reject);
           const out = def.run(args);
           return Promise.resolve(Array.isArray(out) ? finish(out, null, mode) : out).then(resolve, reject);
         } catch (err) {
@@ -1106,6 +1116,10 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
       if (!TABLE_SET.has(table)) throw new FakeDbUnsupported(`failTable("${table}") (not a Call table)`);
       if (error === null) failing.delete(table);
       else failing.set(table, pgError(error?.code ?? "42P01", error?.message ?? `relation "public.${table}" does not exist`));
+    },
+    missingTable(table) {
+      if (!TABLE_SET.has(table)) throw new FakeDbUnsupported(`missingTable("${table}") (not a Call table)`);
+      failing.set(table, pgError("PGRST205", `Could not find the table 'public.${table}' in the schema cache`, null, null));
     },
     reset() {
       for (const t of TABLES) tables[t].length = 0;

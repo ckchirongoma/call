@@ -543,6 +543,29 @@ describe("fake database", () => {
     fake.reset();
     assert.equal((await db().from("brokers").select("id")).error, null);
   });
+
+  test("missingTable(name) answers every query as PostgREST does for a table no migration has created (PGRST205, 404) until failTable(name, null)", async () => {
+    // intel_events before db/0006 is applied: what intel.ts must survive (C-1758).
+    fake.missingTable("intel_events");
+    const row = { at: new Date().toISOString(), seq: 1, app: "call", v: 1, trace_id: "r_0123456789abcdef", kind: "track", name: "probe", actor: "system", content_mode: "full", content: null, meta: {} };
+    const write = await db().from("intel_events").insert([row, { ...row, seq: 2 }]);
+    assert.equal(write.error?.code, "PGRST205");
+    assert.match(write.error!.message, /Could not find the table 'public\.intel_events' in the schema cache/);
+    assert.equal(write.status, 404);
+    assert.equal((await db().from("intel_events").select("trace_id").eq("business_id", "00000000-0000-4000-8000-0000000000c1")).error?.code, "PGRST205");
+    assert.equal((await db().from("intel_events").delete().in("trace_id", ["r_0123456789abcdef"]).select("id")).error?.code, "PGRST205");
+    assert.equal(fake.tables.intel_events.length, 0, "nothing was written");
+    // The table appears (the migration ran): the same batch, with the contract's columns and no created_at, is written.
+    fake.failTable("intel_events", null);
+    assert.equal((await db().from("intel_events").insert([row, { ...row, seq: 2 }])).error, null);
+    assert.deepEqual(fake.tables.intel_events.map((r) => [r.id, r.seq, "created_at" in r]), [[1, 1, false], [2, 2, false]]);
+    // The shapes intel.ts reads and forgets with.
+    const deleted = await db().from("intel_events").delete().in("trace_id", ["r_0123456789abcdef"]).select("id");
+    assert.deepEqual(rowsOf(deleted).map((r) => r.id), [1, 2]);
+    fake.missingTable("intel_events");
+    fake.reset();
+    assert.equal((await db().from("intel_events").select("id")).error, null, "reset() clears it");
+  });
 });
 
 // Each test below is a query the fake used to answer when the real client

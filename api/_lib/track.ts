@@ -3,10 +3,13 @@
 // Ported from Charlie `api/_lib/track.ts`; the why-comments are kept. Trimmed
 // to what Call uses, and the differences are on purpose:
 //   - Call has no `events` table (SPEC §4). An event reaches the record through
-//     the listeners (Chase Intelligence, intel.ts, Task 0.6, writes every one
-//     whole), and a problem is counted in `incidents`. So there is no event
-//     buffer here; "the batched flush" is flushTracking() waiting for every
-//     write in flight, its own and every registered flusher's.
+//     the listeners (Chase Intelligence, intel.ts, writes every one whole: a
+//     `track` row, or an `error` row for every trackFailure(), C-1732/C-1733),
+//     and a problem is counted in `incidents`. So there is no event buffer
+//     here; "the batched flush" is flushTracking() waiting for every write in
+//     flight, its own and every registered flusher's (intel.ts flushIntel).
+//     This file imports intel.ts for that reason: whatever imports track.ts
+//     records into Chase Intelligence, with no entry point left to remember.
 //   - TRACKING_OFF=1 (the test suite, local runs) does NOT stop incidents:
 //     they are still rows (C-1552). What it switches off is the noise around
 //     them — alert emails and self-calls (alerts.ts and queue.ts, Task 0.4) —
@@ -36,6 +39,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { waitUntil } from "@vercel/functions";
 import { db } from "./db.js";
+// For its side effect: intel.ts registers the listener and the flusher below
+// (onTrack, registerFlusher). The import is a cycle (intel.ts imports this
+// file); it is safe because intel.ts calls only this file's hoisted function
+// declarations at load, and the registry lives on globalThis.
+import "./intel.js";
 
 export type EventCategory = "behaviour" | "funnel" | "performance" | "failure" | "security" | "ops";
 export type Severity = "info" | "warn" | "error" | "critical";
@@ -52,6 +60,10 @@ export interface TrackContext {
   jobId?: number | null;
   /** One id for everything a request did (intel.ts: `s_<session>`, `job_<id>`, or `r_` + 16 hex). */
   traceId?: string | null;
+  /** A transcript turn or WhatsApp message this work answers (intel.ts turnIdFor / turnIdForWamid). */
+  turnId?: string | null;
+  /** "meta": Chase Intelligence keeps the shape only, whatever INTEL_CAPTURE says (a declined-consent session). */
+  contentMode?: "full" | "meta";
   /** Shared by everything under one tracked() request: why it failed, for request_failed. */
   request?: { failure?: string };
 }
@@ -208,7 +220,8 @@ const RANK: Record<Severity, number> = { info: 0, warn: 1, error: 2, critical: 3
 // for good), and flushTracking() waits for their writes too. Neither can throw
 // into track() or hold it up.
 
-type TrackListener = (name: string, opts: TrackOptions, ctx: TrackContext) => void;
+/** `failure`: the event came from trackFailure(), whatever category it was filed under. */
+type TrackListener = (name: string, opts: TrackOptions, ctx: TrackContext, failure: boolean) => void;
 type Flusher = { flush: () => Promise<unknown> | void; pending: () => boolean };
 
 // Held on globalThis, reached through a hoisted function: a listener can
@@ -238,10 +251,14 @@ const pendingElsewhere = (): boolean =>
 
 /** Something happened. Never throws, never waits. */
 export function track(name: string, opts: TrackOptions = {}): void {
+  emit(name, opts, false);
+}
+
+function emit(name: string, opts: TrackOptions, failure: boolean): void {
   const ctx = ctxStore.getStore() ?? {};
   for (const l of registry().listeners) {
     try {
-      l(name, opts, ctx);
+      l(name, opts, ctx, failure);
     } catch {
       // A listener is never the reason an event, or a job, fails.
     }
@@ -272,14 +289,18 @@ export function track(name: string, opts: TrackOptions = {}): void {
 export function trackFailure(name: string, err: unknown, opts: TrackOptions = {}): void {
   const message = errorText(err);
   const kind = err instanceof Error && err.name && err.name !== "Error" ? err.name : "";
-  track(name, {
-    ...opts,
-    category: opts.category ?? "failure",
-    severity: opts.severity ?? "error",
-    props: { error: message, ...(kind ? { error_kind: kind } : {}), ...(opts.props ?? {}) },
-    fingerprint: opts.fingerprint ?? `${name}:${normaliseForFingerprint(kind || message).slice(0, 120)}`,
-    summary: opts.summary ?? `${name.replace(/_/g, " ")}: ${message.slice(0, 200)}`,
-  });
+  emit(
+    name,
+    {
+      ...opts,
+      category: opts.category ?? "failure",
+      severity: opts.severity ?? "error",
+      props: { error: message, ...(kind ? { error_kind: kind } : {}), ...(opts.props ?? {}) },
+      fingerprint: opts.fingerprint ?? `${name}:${normaliseForFingerprint(kind || message).slice(0, 120)}`,
+      summary: opts.summary ?? `${name.replace(/_/g, " ")}: ${message.slice(0, 200)}`,
+    },
+    true,
+  );
 }
 
 /** flushTracking()'s bound: queue.ts counts it in the worker's tail after its hard stop. */

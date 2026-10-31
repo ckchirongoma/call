@@ -494,7 +494,10 @@ describe("queue: claiming and fencing", () => {
     const { data: orphan } = await db().from("jobs").insert({ kind: "analyse_needs", session_id: S2, payload: {} }).select("id").single();
     // The forget job names the session it came from, and must still run.
     await queue.enqueue("forget_client", S1, { client_id: "00000000-0000-4000-8000-0000000000c1" });
-    const writesBefore = fake.log.filter((q) => q.op !== "select" && q.table !== "jobs" && q.op !== "rpc").length;
+    // A step's writes, so not the jobs' own status, the rpcs, or the record of
+    // it all (intel_events, written by the flush under `npm run test:intel`).
+    const stepWrites = (): number => fake.log.filter((q) => q.op !== "select" && q.table !== "jobs" && q.table !== "intel_events" && q.op !== "rpc").length;
+    const writesBefore = stepWrites();
 
     const report = await queue.drain({ maxJobs: 5 });
     assert.equal(ran, 0, "no step ran");
@@ -503,7 +506,7 @@ describe("queue: claiming and fencing", () => {
       assert.equal(row.status, "skipped");
       assert.match(String(row.last_error), /session/);
     }
-    assert.equal(fake.log.filter((q) => q.op !== "select" && q.table !== "jobs" && q.op !== "rpc").length, writesBefore, "nothing written but the jobs' own status");
+    assert.equal(stepWrites(), writesBefore, "nothing written but the jobs' own status");
     assert.equal(fake.tables.turns.length, 0);
     assert.equal(forgot, 1, "forget_client runs whatever is left of the session");
   });

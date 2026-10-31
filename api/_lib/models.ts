@@ -29,7 +29,9 @@
 //     routing (require_parameters / ignored providers), embeddings, and the
 //     per-request model-call trace. Call's model work is post-call batch work
 //     inside a job, where the whole-request timer below and the job deadline
-//     bound every call; Chase Intelligence (Task 0.6) records every attempt.
+//     bound every call; Chase Intelligence (intel.ts) records every attempt
+//     whole: callOpenRouter() and each transcription request is one `model`
+//     row, so a retry or a fallback is a second row (C-1721, C-1722).
 //
 // Why model choices live in a table: hosted open-model catalogues retire
 // models with a few weeks' notice by email. When that happens the fix is one
@@ -48,6 +50,7 @@
 
 import { db } from "./db.js";
 import { env } from "./env.js";
+import { capture } from "./intel.js";
 import { DeadlineError, jobCtx, jobMsLeft, onLastAttempt } from "./jobctx.js";
 import { currentTrackContext, errorText, holdForFlush, track, trackFailure } from "./track.js";
 import type { ModelConfig as ModelConfigRow, ModelRole } from "./types.js";
@@ -390,6 +393,8 @@ export interface CallResult {
   truncated: boolean;
   finishReason: string | null;
   model: string;
+  /** The model OpenRouter says answered (its `model` field), when it says. */
+  servedBy?: string;
   /** Which provider behind OpenRouter served it, when OpenRouter says. */
   provider?: string;
   /** `cost` is OpenRouter's own figure in credits, when reported (usage.include). */
@@ -403,11 +408,58 @@ export interface CallOptions {
   reasoning?: unknown;
   timeoutMs?: number;
   role?: Role;
+  /** The ask's label (for the record). */
+  label?: string;
 }
 
-/** One request to one model. */
+/**
+ * One request to one model, recorded whole for Chase Intelligence (intel.ts):
+ * everything the model was shown, everything it said, how long it took, or
+ * how it failed. Recording never changes the call or its result.
+ */
 export async function callOpenRouter(model: string, messages: { role: string; content: unknown }[], opts: CallOptions): Promise<CallResult> {
-  // Task 0.6: capture every attempt here
+  const started = Date.now();
+  try {
+    const r = await callOnce(model, messages, opts);
+    captureCall(model, messages, opts, started, r, undefined);
+    return r;
+  } catch (err) {
+    captureCall(model, messages, opts, started, null, err);
+    throw err;
+  }
+}
+
+/** The `model` row for one attempt (INTEL-CONTRACT §3): the words in content, the facts in meta. */
+function captureCall(model: string, messages: { role: string; content: unknown }[], opts: CallOptions, started: number, r: CallResult | null, err: unknown): void {
+  capture("model", {
+    name: `model_call:${opts.role ?? "unknown"}`,
+    ok: r ? !r.truncated : false,
+    ms: Date.now() - started,
+    // The provider's own error words can echo the prompt, so they go with the words (redacted), not in meta.
+    content: { messages, response: r ? r.text : null, reasoning: opts.reasoning ?? null, ...(err instanceof ModelError && err.body ? { error_body: err.body } : {}) },
+    meta: {
+      model,
+      role: opts.role ?? null,
+      label: opts.label ?? null,
+      served_by: r ? (r.servedBy ?? r.model) : null,
+      provider: r?.provider ?? null,
+      usage: r ? r.usage : null,
+      truncated: r ? r.truncated : false,
+      finish_reason: r?.finishReason ?? null,
+      streamed: false,
+      first_token_ms: null,
+      max_tokens: Math.max(MIN_MAX_TOKENS, opts.maxTokens),
+      temperature: opts.temperature ?? null,
+      json_mode: Boolean(opts.jsonMode),
+      timeout_ms: opts.timeoutMs ?? null,
+      error: err === undefined ? null : errorText(err),
+      error_kind: err === undefined ? null : err instanceof ModelError ? err.kind : err instanceof Error ? err.name : "other",
+      status: err instanceof ModelError ? err.status : null,
+    },
+  });
+}
+
+async function callOnce(model: string, messages: { role: string; content: unknown }[], opts: CallOptions): Promise<CallResult> {
   if (!env.OPENROUTER_API_KEY) throw new ModelError("OPENROUTER_API_KEY is not set", 401, "auth");
 
   // The timer covers the WHOLE request — headers AND body — and is cleared
@@ -472,6 +524,7 @@ async function requestOnce(model: string, messages: { role: string; content: unk
   type Body = {
     choices?: { message?: { content?: unknown }; finish_reason?: unknown }[];
     usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
+    model?: unknown;
     provider?: string;
     error?: { message?: string; code?: number };
   };
@@ -502,7 +555,15 @@ async function requestOnce(model: string, messages: { role: string; content: unk
     out: json.usage?.completion_tokens ?? 0,
     ...(typeof json.usage?.cost === "number" ? { cost: json.usage.cost } : {}),
   };
-  return { text, truncated: finishReason === "length", finishReason, model, usage, ...(typeof json.provider === "string" ? { provider: json.provider } : {}) };
+  return {
+    text,
+    truncated: finishReason === "length",
+    finishReason,
+    model,
+    usage,
+    ...(typeof json.model === "string" && json.model ? { servedBy: json.model } : {}),
+    ...(typeof json.provider === "string" ? { provider: json.provider } : {}),
+  };
 }
 
 // ── Bookkeeping ──────────────────────────────────────────────────
@@ -841,6 +902,7 @@ async function ask<T>(role: Role, prompt: string, opts: AskOptions<T>, json: boo
           reasoning: cfg.params.reasoning,
           timeoutMs,
           role,
+          label,
         });
       } catch (err) {
         if (!(err instanceof ModelError)) {
@@ -1076,17 +1138,48 @@ export async function transcribeAudio(bytes: Uint8Array, mime: string, opts: Tra
     for (const rich of driver.richFormat ? [true, false] : [false]) {
       const timeoutMs = callWindow("transcribe", deadlineAt);
       tries++;
+      // Each request is one `model` row (C-1722): the audio as its type and
+      // size, never its bytes; what was heard, or how it failed.
+      const started = Date.now();
+      const note = (ok: boolean, more: { status?: number; error?: string; heard?: Transcript }): void =>
+        capture("model", {
+          name: "model_call:voice",
+          ok,
+          ms: Date.now() - started,
+          content: {
+            audio: { type: mime || "audio/webm", size: bytes.byteLength },
+            prompt: decoderHint(opts.hint),
+            language: language ?? null,
+            response: more.heard ? more.heard.text : null,
+            ...(more.heard?.segments ? { segments: more.heard.segments } : {}),
+          },
+          meta: {
+            model,
+            role: "voice",
+            served_by: ok ? model : null,
+            provider,
+            usage: more.heard?.duration !== undefined ? { seconds: more.heard.duration } : null,
+            truncated: false,
+            streamed: false,
+            first_token_ms: null,
+            response_format: rich ? "verbose_json" : "json",
+            status: more.status ?? null,
+            error: more.error ?? null,
+          },
+        });
       let res: Response;
       try {
         res = await fetch(driver.url, { method: "POST", headers: { Authorization: `Bearer ${driver.key}` }, body: build(rich), signal: AbortSignal.timeout(timeoutMs) });
       } catch (err) {
         console.warn(`transcribe [${provider}] ${modelId}: ${isAbort(err) ? "timed out" : "unreachable"}`);
+        note(false, { error: isAbort(err) ? "timed out" : "unreachable" });
         reason = "network";
         break;
       }
       if (!res.ok) {
         // The provider's own words stay out of the incident: they can echo what was sent.
         const body = (await res.text().catch(() => "")).slice(0, 400);
+        note(false, { status: res.status, error: `HTTP ${res.status}` });
         // A 400 on verbose_json means this upstream does not support it. Retry plain.
         if (rich && res.status === 400) continue;
         const kind = kindFor(res.status);
@@ -1104,19 +1197,22 @@ export async function transcribeAudio(bytes: Uint8Array, mime: string, opts: Tra
         json = (await res.json()) as typeof json;
       } catch {
         // A JSON parse error quotes the start of the body, which can be the transcript itself.
+        note(false, { status: res.status, error: "an answer that is not JSON" });
         reason = "upstream";
         break;
       }
       const segments = (Array.isArray(json.segments) ? json.segments : [])
         .filter((s): s is { start: number; end: number; text: string } => isRecord(s) && typeof s.start === "number" && typeof s.end === "number" && typeof s.text === "string")
         .map((s) => ({ start: s.start, end: s.end, text: s.text.trim() }));
-      return {
+      const heard: Transcript = {
         text: String(json.text ?? "").trim(),
         model,
         ...(segments.length ? { segments } : {}),
         ...(typeof json.language === "string" ? { language: json.language } : {}),
         ...(typeof json.duration === "number" ? { duration: json.duration } : {}),
       };
+      note(true, { status: res.status, heard });
+      return heard;
     }
   }
   const err = new ModelUnavailable("voice", reason, tries, models);
