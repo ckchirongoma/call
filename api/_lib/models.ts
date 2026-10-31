@@ -13,8 +13,15 @@
 //     runs on HARD_FALLBACKS (C-1523).
 //   - A 400 is our bug and is surfaced, never routed around (C-1512); a 404 is
 //     a model the catalogue retired, which is exactly what a fallback is for.
+//     Charlie's one exception is kept: a 400 refusing response_format is the
+//     same model asked once without it.
+//   - A 402 on a paid model skips the paid models left, not the :free ones: the
+//     free stack's first last resort is paid, and the credit incident is raised
+//     only when no free model answers either.
 //   - JSON is repaired (fences, trailing commas, prose around it), then asked
-//     for once more, then the step fails (C-1515–C-1520).
+//     for once more, then the step fails (C-1515–C-1520). A top-level list is
+//     rejected as Charlie's was, and an object that never closes is a cut-off
+//     reply (more room) whatever finish_reason says.
 //   - Every attempt that spent tokens is a usage_ledger row (C-1504), and an
 //     answer from anything but the row's own model is a safety_events note
 //     (C-1514).
@@ -123,6 +130,12 @@ const WRAP_UP_MS = 5_000;
 
 /** The longest one request may run, headers and body, when no deadline is nearer. */
 const REQUEST_TIMEOUT_MS = 90_000;
+
+/** A slug OpenRouter serves without charge; a 402 for want of credit does not refuse these. */
+const isFree = (model: string): boolean => /:free$/.test(model);
+
+/** A 400 that is a model refusing `response_format`, which the one retry without it answers. */
+const NAMES_RESPONSE_FORMAT = /response_format|response format|json_object|json mode/i;
 
 /** Appended to the prompt for the one retry after a reply that could not be read as JSON (C-1518). */
 export const JSON_ONLY = "Return JSON only: one JSON object, with no prose before or after it and no code fences.";
@@ -352,8 +365,9 @@ function callWindow(label: string, askDeadlineAt: number | null): number {
 const isAbort = (err: unknown): boolean => err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
 
 /**
- * What an HTTP status means for the chain. 401/403 and 402 stop everything
- * (every model is on the same account); 429, 5xx and 404 move to the next model
+ * What an HTTP status means for the chain. 401/403 stop everything (every
+ * model is on the same account); 402 stops the paid models only, unless a
+ * :free model gets it (the ask loop says why); 429, 5xx and 404 move to the next model
  * (a 404 is "no endpoints for this model": the catalogue retired it, which is
  * exactly what the fallbacks exist for); any other 4xx is a request we got
  * wrong, which no other model will take either.
@@ -415,6 +429,21 @@ export async function callOpenRouter(model: string, messages: { role: string; co
 
 async function requestOnce(model: string, messages: { role: string; content: unknown }[], opts: CallOptions, signal: AbortSignal, timeoutMs: number): Promise<CallResult> {
   const seconds = Math.round(timeoutMs / 1000);
+  // Built before the try below, not inside it: a request we cannot even write
+  // (a value JSON cannot carry) is our bug, and must surface as one — not be
+  // relabelled "unreachable" and handed to the next model to fail the same way.
+  const body = JSON.stringify({
+    model,
+    messages,
+    // Floored here too, for every caller, so a small budget can never
+    // starve a reasoning model of the room to answer.
+    max_tokens: Math.max(MIN_MAX_TOKENS, opts.maxTokens),
+    ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+    ...(opts.jsonMode ? { response_format: { type: "json_object" } } : {}),
+    ...(opts.reasoning ? { reasoning: opts.reasoning } : {}),
+    // Asks OpenRouter to report what the call cost.
+    usage: { include: true },
+  });
   let res: Response;
   try {
     res = await fetch(OPENROUTER_URL, {
@@ -426,18 +455,7 @@ async function requestOnce(model: string, messages: { role: string; content: unk
         ...(env.PUBLIC_BASE_URL ? { "HTTP-Referer": env.PUBLIC_BASE_URL } : {}),
         "X-Title": "Call",
       },
-      body: JSON.stringify({
-        model,
-        messages,
-        // Floored here too, for every caller, so a small budget can never
-        // starve a reasoning model of the room to answer.
-        max_tokens: Math.max(MIN_MAX_TOKENS, opts.maxTokens),
-        ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
-        ...(opts.jsonMode ? { response_format: { type: "json_object" } } : {}),
-        ...(opts.reasoning ? { reasoning: opts.reasoning } : {}),
-        // Asks OpenRouter to report what the call cost.
-        usage: { include: true },
-      }),
+      body,
       signal,
     });
   } catch (err) {
@@ -465,6 +483,8 @@ async function requestOnce(model: string, messages: { role: string; content: unk
     if (isAbort(err)) throw new ModelError(`${model} did not answer in time (${seconds}s, body)`, 0, "network");
     throw new ModelError(`${model} answered with a body that is not JSON`, 200, "upstream");
   }
+  // `null`, a number, a list: JSON, but not an answer. The provider's failure, not ours.
+  if (!isRecord(json)) throw new ModelError(`${model} answered with a body that is not an object`, 200, "upstream");
 
   // OpenRouter can return HTTP 200 with a top-level error object: a provider
   // behind it failed, which another model may not.
@@ -496,7 +516,7 @@ const rate = (v: unknown): number => (typeof v === "number" && Number.isFinite(v
  * call rounded down to 0 would read as free on /app/costs.
  */
 export function costCents(model: string, usage: { in: number; out: number }, params: ModelParams): number {
-  if (/:free$/.test(model)) return 0;
+  if (isFree(model)) return 0;
   const cents = (usage.in * rate(params.cost_per_mtok_in) + usage.out * rate(params.cost_per_mtok_out)) / 1_000_000;
   return cents > 0 ? Math.ceil(cents) : 0;
 }
@@ -580,14 +600,20 @@ function trackUnavailable(role: Role, label: string, tries: number, err: unknown
     fingerprint: `model_call_failed:${role}:${retried ? "out_of_time_retried" : kind}`,
     summary: retried
       ? `A ${role} model call (${label}) had no time left in its job attempt; the job goes to a fresh worker`
-      : `A ${role} model call (${label}) failed after ${tries} ${tries === 1 ? "try" : "tries"} (${kind})`,
+      : // A bug's own words are the only clue to it; a provider's never reach here (errorText).
+        `A ${role} model call (${label}) failed after ${tries} ${tries === 1 ? "try" : "tries"} (${kind})${kind === "other" ? `: ${errorText(err).slice(0, 160)}` : ""}`,
   });
 }
 
 // ── JSON ─────────────────────────────────────────────────────────
 
-/** Index of the brace that closes the object opening at `start`, ignoring braces inside strings; -1 if it never closes. */
+/**
+ * Index of the bracket that closes the object (`{`) or list (`[`) opening at
+ * `start`, ignoring brackets inside strings; -1 if it never closes.
+ */
 function balancedEnd(s: string, start: number): number {
+  const open = s[start];
+  const close = open === "[" ? "]" : "}";
   let depth = 0;
   let inString = false;
   let escaped = false;
@@ -600,11 +626,33 @@ function balancedEnd(s: string, start: number): number {
       continue;
     }
     if (ch === '"') inString = true;
-    else if (ch === "{") depth++;
-    else if (ch === "}" && --depth === 0) return i;
+    else if (ch === open) depth++;
+    else if (ch === close && --depth === 0) return i;
   }
   return -1;
 }
+
+/**
+ * Whether the object opening at `at` is an element of a list: a `[` before it
+ * that is still open there ("whole"), or that never closes at all ("cut").
+ * A bracket in the prose that closes before the object ("see note [1]") is not.
+ */
+function listAround(s: string, at: number): "whole" | "cut" | null {
+  for (let i = s.indexOf("["); i !== -1 && i < at; i = s.indexOf("[", i + 1)) {
+    const end = balancedEnd(s, i);
+    if (end === -1) return "cut";
+    if (end > at) return "whole";
+  }
+  return null;
+}
+
+/**
+ * Only a fence that opens or closes the reply is removed. Fences anywhere else
+ * are left alone: inside a JSON string they are the client's words (a quote
+ * with ``` in it), and around an object in prose they change nothing, because
+ * the object is found by its brackets.
+ */
+const stripOuterFence = (s: string): string => s.replace(/^\s*```[\w-]*[ \t]*(\r?\n|$)/, "").replace(/(^|\r?\n)[ \t]*```\s*$/, "");
 
 /** A comma before a closing brace or bracket, outside strings, is dropped (C-1516). */
 function dropTrailingCommas(s: string): string {
@@ -639,25 +687,38 @@ const tryParse = (s: string): unknown => {
   }
 };
 
+/** The object a reply holds, or why there is none: `cutOff` when what it opened never closes (a size problem). */
+type Scan = { value: Record<string, unknown> } | { value?: undefined; cutOff: boolean };
+
+function scanJSON(text: string): Scan {
+  const clean = stripOuterFence(String(text ?? ""));
+  let start = clean.indexOf("{");
+  while (start !== -1) {
+    // A list is not the object asked for. Charlie's extractJSON rejected one
+    // (its first-{-to-last-} slice does not parse), and so does this: taking
+    // its first element would read as a whole answer with every fact after
+    // the first missing. The JSON_ONLY retry asks for one object instead.
+    const list = listAround(clean, start);
+    if (list) return { cutOff: list === "cut" };
+    const end = balancedEnd(clean, start);
+    if (end === -1) return { cutOff: true };
+    const candidate = clean.slice(start, end + 1);
+    const parsed = tryParse(candidate) ?? tryParse(dropTrailingCommas(candidate));
+    if (isRecord(parsed)) return { value: parsed };
+    start = clean.indexOf("{", end + 1);
+  }
+  return { cutOff: false };
+}
+
 /**
  * Pull the JSON object out of a reply that may be fenced (C-1515), carry
  * trailing commas (C-1516) or sit in prose (C-1517): the first balanced object,
  * braces inside strings ignored. An object that never closes is null, never a
  * fragment of it: an inner object of a cut-off reply would read as a whole
- * answer with half the facts missing.
+ * answer with half the facts missing. A top-level list is null too (above).
  */
-export function extractJSON(text: string): unknown | null {
-  const clean = String(text ?? "").replace(/```[a-z]*/gi, "");
-  let start = clean.indexOf("{");
-  while (start !== -1) {
-    const end = balancedEnd(clean, start);
-    if (end === -1) return null;
-    const candidate = clean.slice(start, end + 1);
-    const parsed = tryParse(candidate) ?? tryParse(dropTrailingCommas(candidate));
-    if (isRecord(parsed)) return parsed;
-    start = clean.indexOf("{", end + 1);
-  }
-  return null;
+export function extractJSON(text: string): Record<string, unknown> | null {
+  return scanJSON(text).value ?? null;
 }
 
 // ── Asking ───────────────────────────────────────────────────────
@@ -685,18 +746,25 @@ export interface AskResult<T> {
   usage: { in: number; out: number };
 }
 
-type Parsed<T> = { ok: true; value: T } | { ok: false };
+/** `cutOff`: the reply opened an object or a list and never closed it, whatever finish_reason said. */
+type Parsed<T> = { ok: true; value: T } | { ok: false; cutOff?: boolean };
 
 /**
  * Ask for JSON and get a parsed object, or throw.
  *
  * Retry policy, in order of cost:
  *   cut off or empty → same model, double the room (cap 8000), twice; then the
- *                      next model, keeping the larger room
+ *                      next model, keeping the larger room. "Cut off" is
+ *                      finish_reason=length, or an object or list that opens
+ *                      and never closes under any finish_reason
  *   429 / 5xx / 404 / network → next model in the chain immediately
  *   unreadable JSON  → same model once, with JSON_ONLY appended; then fail
+ *   400 naming response_format, with json_mode on → same model once without it
  *   400              → ModelBadRequest, no fallback
- *   401 / 403 / 402  → ModelUnavailable and a critical incident, no fallback
+ *   402 on a paid model → the paid models left are skipped; the :free ones are
+ *                      tried, and the credit incident is raised only if none answers
+ *   401 / 403, or 402 on a :free model → ModelUnavailable and a critical incident, no fallback
+ *   a bug in our own request code → thrown as it is, to no other model
  *   out of time      → DeadlineError, before the request that could not finish
  *
  * "Empty" is a size problem too. Charlie's production incident, 2026-09-20: a
@@ -707,9 +775,10 @@ type Parsed<T> = { ok: true; value: T } | { ok: false };
 export async function askJSON<T = Record<string, unknown>>(role: Role, prompt: string, opts: AskOptions<T> = {}): Promise<AskResult<T>> {
   const schema = opts.schema;
   return ask<T>(role, prompt, opts, true, (text) => {
-    const parsed = extractJSON(text);
-    if (parsed === null || (schema && !schema(parsed))) return { ok: false };
-    return { ok: true, value: parsed as T };
+    const scan = scanJSON(text);
+    if (scan.value === undefined) return { ok: false, cutOff: scan.cutOff };
+    if (schema && !schema(scan.value)) return { ok: false };
+    return { ok: true, value: scan.value as T };
   });
 }
 
@@ -735,6 +804,8 @@ async function ask<T>(role: Role, prompt: string, opts: AskOptions<T>, json: boo
   let tries = 0;
   const tried: string[] = [];
   const total = { in: 0, out: 0 };
+  // Set by a 402 from a paid model (below): the account cannot pay for any.
+  let creditRefused: { status: number; model: string } | null = null;
 
   const giveUp = (err: Error): Error => {
     trackUnavailable(role, label, tries, err);
@@ -742,9 +813,15 @@ async function ask<T>(role: Role, prompt: string, opts: AskOptions<T>, json: boo
   };
 
   for (const model of chain) {
+    // The account was refused for a paid model: every paid model left would be
+    // refused the same way, so only the :free ones are worth a request.
+    if (creditRefused && !isFree(model)) continue;
     tried.push(model);
     let sizeRetries = 0;
     let jsonRetried = false;
+    // Per model, not per ask: one model refusing response_format says nothing
+    // about the next one (Charlie dropped it for the rest of the chain).
+    let modelJsonMode = jsonMode;
     for (;;) {
       let timeoutMs: number;
       try {
@@ -760,17 +837,43 @@ async function ask<T>(role: Role, prompt: string, opts: AskOptions<T>, json: boo
         out = await callOpenRouter(model, [{ role: "user", content: jsonRetried ? `${prompt}\n\n${JSON_ONLY}` : prompt }], {
           maxTokens: room,
           temperature,
-          jsonMode,
+          jsonMode: modelJsonMode,
           reasoning: cfg.params.reasoning,
           timeoutMs,
           role,
         });
       } catch (err) {
-        const e = err instanceof ModelError ? err : new ModelError(`${model}: ${String(err)}`, 0, "network");
+        if (!(err instanceof ModelError)) {
+          // Not the provider and not the network: a bug in our own request
+          // code. Another model would hit the same bug, and calling it
+          // "network" would hide it, so it is thrown as it is, words kept.
+          console.log(`model bug [${label}] ${model}: ${errorText(err)}`);
+          throw giveUp(err instanceof Error ? err : new Error(String(err)));
+        }
+        const e = err;
+        if (e.kind === "credit" && !isFree(model)) {
+          // OpenRouter's 402 for want of credit refuses paid models only; a
+          // :free model still answers while the balance is not below zero. On
+          // the free stack the first last resort is paid, so stopping here
+          // would skip the four free ones on exactly the day they are needed.
+          console.log(`model credit [${label}] ${model} ${e.status}: paid models skipped, the :free ones are still tried`);
+          creditRefused = { status: e.status, model };
+          reason = "credit";
+          break;
+        }
         if (e.kind === "auth" || e.kind === "credit") {
+          // 401/403: the key itself. A 402 on a :free model: the balance is below zero.
           console.log(`model fatal [${label}] OpenRouter ${e.status} ${e.kind}`);
           credentialIncident("openrouter", role, e.status, e.kind, model);
           throw new ModelUnavailable(role, e.kind, tries, tried, `OpenRouter ${e.status}`);
+        }
+        if (e.kind === "bad_request" && modelJsonMode && NAMES_RESPONSE_FORMAT.test(e.body)) {
+          // Charlie: "jsonMode … dropped automatically if it 400s". This model
+          // does not take response_format; the same model, once, without it.
+          // Not a fallback, so C-1512 still holds for every other 400.
+          console.log(`model [${label}] ${model} ${e.status}: response_format refused; retrying without it`);
+          modelJsonMode = false;
+          continue;
         }
         if (e.kind === "bad_request") {
           console.log(`model bad-request [${label}] ${model} ${e.status}`);
@@ -786,9 +889,13 @@ async function ask<T>(role: Role, prompt: string, opts: AskOptions<T>, json: boo
       total.out += out.usage.out;
       recordTokens(sessionId, model, out.usage, cfg.params);
 
-      if (out.truncated || !out.text.trim()) {
+      const parsed = out.truncated || !out.text.trim() ? null : parse(out.text);
+      // An object or list that opens and never closes was cut off, whatever
+      // finish_reason says: some providers report "stop" on a reply they cut.
+      const cutOff = parsed !== null && !parsed.ok && parsed.cutOff === true;
+      if (parsed === null || cutOff) {
         // A size problem, even when what arrived parses (C-1501).
-        reason = out.truncated ? "truncated" : "empty";
+        reason = out.truncated || cutOff ? "truncated" : "empty";
         const grown = Math.min(Math.max(room, MAX_MAX_TOKENS), room * 2);
         const couldGrow = grown > room;
         room = grown;
@@ -797,7 +904,6 @@ async function ask<T>(role: Role, prompt: string, opts: AskOptions<T>, json: boo
         break;
       }
 
-      const parsed = parse(out.text);
       if (parsed.ok) {
         console.log(`model ok [${label}] ${model} in=${out.usage.in} out=${out.usage.out} ms=${Date.now() - started} tries=${tries}${model !== ownModel ? ` fallback-from=${ownModel ?? "(no row)"}` : ""}`);
         if (model !== ownModel) noteFallback(cfg, sessionId, model, reason, tries);
@@ -816,6 +922,12 @@ async function ask<T>(role: Role, prompt: string, opts: AskOptions<T>, json: boo
       console.log(`model bad-json [${label}] ${model} after the JSON-only retry`);
       throw giveUp(new ModelUnavailable(role, "bad_output", tries, tried, `${model} did not return the JSON asked for`));
     }
+  }
+  if (creditRefused) {
+    // A paid model was refused for credit and no free model answered: now
+    // it is a step that cannot run until someone tops up, and worth a page.
+    credentialIncident("openrouter", role, creditRefused.status, "credit", creditRefused.model);
+    throw new ModelUnavailable(role, "credit", tries, tried, `OpenRouter ${creditRefused.status} on the paid models, and no :free model answered`);
   }
   const kind: UnavailableKind = reason === "none" ? "upstream" : reason;
   throw giveUp(new ModelUnavailable(role, kind, tries, tried));

@@ -13,7 +13,8 @@
 import "./_env.ts";
 import { test, describe, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -100,27 +101,98 @@ function webhookHandlers(root: string): string[] {
  * HMAC over exactly what was sent; a body that was parsed and re-serialised, or
  * decoded to a string, is not those bytes (key order, whitespace, a multibyte
  * character), so the check fails for honest senders — or, worse, someone
- * "fixes" that by verifying something else. A handler either reads the stream
- * itself (a Web Request's arrayBuffer()/bytes()/getReader(), or a Node
- * request's chunks) or switches the platform's parser off.
+ * "fixes" that by verifying something else. A handler either reads the
+ * request's stream itself (`req`/`request`: arrayBuffer(), bytes(),
+ * body.getReader(), or a Node request's chunks with `for await (… of req)`) or
+ * switches the platform's parser off — and never parses the request as well
+ * (text(), json(), formData()). Matched on the code alone, comments and string
+ * text removed: this codebase comments heavily, and a header saying "reads the
+ * body with arrayBuffer()" next to a req.json() must not pass. So a webhook
+ * names its request `req` or `request`, and reads it in the handler file.
  */
-const READS_RAW = /bodyParser\s*:\s*false|\.arrayBuffer\(\s*\)|\.bytes\(\s*\)|\.getReader\(\s*\)|for\s+await\s*\(/;
-const webhooksReadRawBytes = (root: string): string[] =>
-  webhookHandlers(root)
-    .filter((rel) => !READS_RAW.test(read(root, rel)))
-    .map((rel) => `${rel}:1: a webhook handler that never reads the raw body (arrayBuffer(), bytes(), the stream, or bodyParser: false)`);
+const REQ = String.raw`\b(?:req|request)(?:\s*\.\s*clone\s*\(\s*\))?`;
+const READS_RAW = new RegExp(
+  [
+    String.raw`bodyParser\s*:\s*false`,
+    String.raw`${REQ}\s*\.\s*(?:arrayBuffer|bytes)\s*\(\s*\)`,
+    String.raw`${REQ}\s*\.\s*body\s*!?\s*\??\.\s*getReader\s*\(`,
+    String.raw`for\s+await\s*\(\s*(?:const|let|var)\s+\w+\s+of\s+(?:req|request)\s*\)`,
+  ].join("|"),
+);
+const PARSES_BODY = new RegExp(String.raw`${REQ}\s*\.\s*(?:json|text|formData)\s*\(`);
+function webhooksReadRawBytes(root: string): string[] {
+  const out: string[] = [];
+  for (const rel of webhookHandlers(root)) {
+    const code = stripSource(read(root, rel));
+    if (!READS_RAW.test(code)) out.push(`${rel}:1: a webhook handler that never reads the raw body (req.arrayBuffer(), req.bytes(), the request's stream, or bodyParser: false)`);
+    if (PARSES_BODY.test(code)) out.push(`${rel}:1: a webhook handler that parses the request (json(), text(), formData()): parse the raw bytes it verified`);
+  }
+  return out;
+}
 
 /**
  * SPEC §2: a webhook stores the event, enqueues a job and answers 200 in under
  * a second; the model work happens in the job. A model call in the handler
  * makes the sender wait on a model — ElevenLabs does not retry by default, so a
  * timeout there is a call that never reaches the broker.
+ *
+ * What this proves, precisely: no file a webhook handler reaches through its
+ * relative value imports — the handler itself, and every api/ file those import
+ * in turn — imports _lib/models, calls askJSON/askText/transcribeAudio, or names
+ * openrouter.ai, with two stops. The walk does not go past api/_lib/queue.ts:
+ * enqueue() is the door into job work, and whatever the queue's handlers import
+ * runs in a job, not in the request. Nor past api/_lib/models.ts itself (the
+ * import of it is the offence). Type-only imports are erased and comments are
+ * not code. What it cannot see: a model reached some way other than an import
+ * (a fetch to a URL built at run time) — Task 3.3's handler test proves askJSON
+ * is never called while the post-call webhook answers.
  */
-const MODEL_CALL = /_lib\/models(\.js|\.ts)?["']|\b(askJSON|askText|transcribeAudio)\s*[<(]|openrouter\.ai/g;
-const noModelCallInWebhooks = (root: string): string[] => {
-  const handlers = new Set(webhookHandlers(root));
-  return grep(root, "api", MODEL_CALL, (rel) => handlers.has(rel));
-};
+const MODEL_CALL = /\b(askJSON|askText|transcribeAudio)\s*[<(]|openrouter\.ai/g;
+const MODELS = "api/_lib/models.ts";
+const QUEUE = "api/_lib/queue.ts";
+function noModelCallInWebhooks(root: string): string[] {
+  const out: string[] = [];
+  for (const handler of webhookHandlers(root)) {
+    const seen = new Set<string>([handler]);
+    const todo = [handler];
+    while (todo.length) {
+      const rel = todo.shift()!;
+      const code = valueCode(read(root, rel));
+      const offence = (line: number, what: string): void => {
+        out.push(rel === handler ? `${rel}:${line}: ${what}` : `${handler}:1: reaches ${rel}:${line}: ${what}`);
+      };
+      for (const m of code.matchAll(MODEL_CALL)) offence(lineOf(code, m.index!), m[0]);
+      for (const imp of relativeImports(rel, code)) {
+        if (imp.target === MODELS) offence(imp.line, `import ${imp.spec}`);
+        const file = [imp.target, imp.index].find((p) => existsSync(join(root, p)) && statSync(join(root, p)).isFile());
+        if (!file || seen.has(file)) continue;
+        seen.add(file);
+        if (file !== QUEUE && file !== MODELS) todo.push(file);
+      }
+    }
+  }
+  return out;
+}
+
+/** Source with comments and type-only imports blanked (newlines kept, so line numbers hold); strings kept. */
+const valueCode = (src: string): string =>
+  stripSource(src, true).replace(/^[ \t]*(import|export)\s+type\b[^;]*;/gm, (m) => m.replace(/[^\n]/g, ""));
+
+/**
+ * What `rel` imports by a relative path (static, re-export, side-effect or
+ * dynamic): the .ts it names (api/ imports name the .js the platform will run)
+ * and the index.ts of a folder, whether or not either exists.
+ */
+function relativeImports(rel: string, code: string): { spec: string; target: string; index: string; line: number }[] {
+  const out: { spec: string; target: string; index: string; line: number }[] = [];
+  for (const m of code.matchAll(/\bfrom\s*["'](\.[^"']+)["']|\bimport\s*\(\s*["'](\.[^"']+)["']\s*\)|\bimport\s*["'](\.[^"']+)["']/g)) {
+    const spec = m[1] ?? m[2] ?? m[3]!;
+    const base = join(dirname(rel), spec).split(sep).join("/");
+    const target = /\.js$/.test(base) ? base.replace(/\.js$/, ".ts") : /\.ts$/.test(base) ? base : `${base}.ts`;
+    out.push({ spec, target, index: `${base}/index.ts`, line: lineOf(code, m.index!) });
+  }
+  return out;
+}
 
 /**
  * Minimality (SPEC R11, C-1439): a request body is a transcript, a phone
@@ -128,12 +200,14 @@ const noModelCallInWebhooks = (root: string): string[] => {
  * them when a client says "forget me" (R15). So no console call under api/
  * may log a body. A message about the body is fine; the body is not — hence
  * the words inside string literals are removed before looking (a template
- * literal keeps its ${…} expressions), and what is left is searched for
- * anything body-like: body, rawBody, raw, or the request read in place
- * (req.text(), request.json()). A variable named body is taken to be one,
- * whatever it holds: call an upstream error's text something else.
+ * literal keeps its ${…} expressions), and what is left is searched as the
+ * criterion's own grep searches (`console.log(.*body`, case-insensitive): "body"
+ * anywhere in the code of the call — body, rawBody, bodyText, bodyJson, req.body
+ * — or raw*, or the request read in place (req.text(), request.json()). A name
+ * with "body" in it is taken to be one, whatever it holds: call an upstream
+ * error's text something else.
  */
-const BODY_LIKE = /\b\w*body\b|\braw\w*\b|\b(req|request)\s*\.\s*(text|json|formData|arrayBuffer|bytes)\s*\(/i;
+const BODY_LIKE = /body|\braw\w*\b|\b(req|request)\s*\.\s*(text|json|formData|arrayBuffer|bytes)\s*\(/i;
 function noBodyInLogs(root: string): string[] {
   const out: string[] = [];
   for (const rel of files(root, "api").filter((f) => SOURCE.test(f))) {
@@ -196,6 +270,95 @@ function scanCode(src: string, i: number, close: ")" | "}"): { code: string; end
   return { code, end: i };
 }
 
+/**
+ * The source with every comment removed and — unless `keepStrings` — the text
+ * of every string literal removed (template literals keep their ${…}
+ * expressions, which are code). Newlines are kept, so line numbers hold. A `/`
+ * where a value cannot stand (after an operator, a bracket or a keyword) opens
+ * a regex literal, which is kept whole, so a quote inside one starts no
+ * string. Enough of a tokenizer for these checks; not a JavaScript parser.
+ */
+function stripSource(src: string, keepStrings = false): string {
+  let out = "";
+  const regexMayStart = (): boolean => {
+    const before = out.replace(/\s+$/, "");
+    if (!before) return true;
+    if ("(,=:[!&|?{};+-*%<>~^".includes(before.at(-1)!)) return true;
+    return /\b(return|typeof|case|do|else|in|of|new|delete|void|throw|await|yield)$/.test(before);
+  };
+  const regexEnd = (i: number): number => {
+    let inClass = false;
+    for (let j = i + 1; j < src.length && src[j] !== "\n"; j++) {
+      const c = src[j];
+      if (c === "\\") j++;
+      else if (inClass) inClass = c !== "]";
+      else if (c === "[") inClass = true;
+      else if (c === "/") {
+        j++;
+        while (/[a-z]/i.test(src[j] ?? "")) j++;
+        return j;
+      }
+    }
+    return i + 1; // no closing slash on the line: a division after all
+  };
+  // Code from i; inside a template's ${…}, stops after the brace that closes it.
+  const code = (i: number, inTemplate: boolean): number => {
+    let depth = 0;
+    while (i < src.length) {
+      const c = src[i]!;
+      const d = src[i + 1];
+      if (c === "/" && d === "/") {
+        while (i < src.length && src[i] !== "\n") i++;
+      } else if (c === "/" && d === "*") {
+        const close = src.indexOf("*/", i + 2);
+        const end = close === -1 ? src.length : close + 2;
+        out += src.slice(i, end).replace(/[^\n]/g, "");
+        i = end;
+      } else if (c === '"' || c === "'") {
+        const end = skipQuoted(src, i);
+        out += keepStrings ? src.slice(i, end) : c + c;
+        i = end;
+      } else if (c === "`") {
+        i = template(i);
+      } else if (c === "/" && regexMayStart()) {
+        const end = regexEnd(i);
+        out += src.slice(i, end);
+        i = end;
+      } else {
+        if (c === "{") depth++;
+        else if (c === "}") {
+          if (inTemplate && depth === 0) return i + 1;
+          depth--;
+        }
+        out += c;
+        i++;
+      }
+    }
+    return i;
+  };
+  const template = (i: number): number => {
+    out += "`";
+    i++;
+    while (i < src.length && src[i] !== "`") {
+      if (src[i] === "\\") {
+        if (keepStrings) out += src.slice(i, i + 2);
+        i += 2;
+      } else if (src[i] === "$" && src[i + 1] === "{") {
+        out += "${";
+        i = code(i + 2, true);
+        out += "}";
+      } else {
+        if (keepStrings || src[i] === "\n") out += src[i];
+        i++;
+      }
+    }
+    out += "`";
+    return i + 1;
+  };
+  code(0, false);
+  return out;
+}
+
 /** Vercel's `functions` keys are globs: `*` within one path segment, `**` across segments. */
 function globMatches(glob: string, path: string): boolean {
   let re = "";
@@ -242,6 +405,33 @@ function vercelAgreesWithApi(root: string): string[] {
     if (!entries.some((f) => f.replace(SOURCE, "") === target)) out.push(`vercel.json:1: cron "${cron.path}" has no entry point under api/`);
   }
   return out;
+}
+
+/**
+ * SPEC R10: no model slug in api/ but HARD_FALLBACKS (C-1527, C-1528). The
+ * check is scripts/grep-models.sh, which CI runs; these run that very script,
+ * copied into a tree of our making (it cds to its own parent and greps api/).
+ */
+const GREP_MODELS = "scripts/grep-models.sh";
+function slugGrep(root: string): { status: number | null; out: string } {
+  if (root !== REPO) {
+    mkdirSync(join(root, "scripts"), { recursive: true });
+    copyFileSync(join(REPO, GREP_MODELS), join(root, GREP_MODELS));
+  }
+  const run = spawnSync("bash", [join(root, GREP_MODELS)], { encoding: "utf8" });
+  return { status: run.status, out: `${run.stdout}${run.stderr}` };
+}
+
+/**
+ * The script exempts api/_lib/models.ts whole; the rule (SPEC R10) exempts its
+ * HARD_FALLBACKS only. So: models.ts with that one array cut out, at a path
+ * the script does not exempt, must pass the script's own grep.
+ */
+const HARD_FALLBACKS_BLOCK = /export const HARD_FALLBACKS\b[^=]*=\s*\[[\s\S]*?\];/;
+function slugsOutsideHardFallbacks(root: string): { status: number | null; out: string } {
+  const src = read(root, "api/_lib/models.ts");
+  assert.match(src, HARD_FALLBACKS_BLOCK, "api/_lib/models.ts has no HARD_FALLBACKS array to exempt");
+  return slugGrep(tempTree({ "api/_lib/models-without-hard-fallbacks.ts": src.replace(HARD_FALLBACKS_BLOCK, "") }));
 }
 
 // ── A temporary tree to prove each check bites ──────────────────────────────
@@ -292,10 +482,23 @@ describe("this repository", () => {
     assert.deepEqual(noBodyInLogs(REPO), []);
   });
 
+  test("[C-1528] grep-models passes on this tree, whose api/_lib/models.ts holds HARD_FALLBACKS, and nothing in models.ts but that array is a slug", () => {
+    const real = slugGrep(REPO);
+    assert.equal(real.status, 0, real.out);
+    assert.match(real.out, /No hardcoded model slugs under api\//);
+    // The exemption is in use, not idle: the slugs it lets through are there.
+    const block = read(REPO, "api/_lib/models.ts").match(HARD_FALLBACKS_BLOCK)?.[0] ?? "";
+    assert.ok((block.match(/"[a-z0-9-]+\/[^"]+"/g) ?? []).length >= 2, block);
+    const rest = slugsOutsideHardFallbacks(REPO);
+    assert.equal(rest.status, 0, `a slug in models.ts outside HARD_FALLBACKS:\n${rest.out}`);
+  });
+
   // No criterion of its own: the ground C-1565 (crons, Task 11.1) stands on. A
-  // functions key naming a file that does not exist is ignored by the platform,
-  // so a renamed handler silently loses its maxDuration; a cron path with no
-  // handler is a scheduled 404 nobody sees.
+  // functions key naming a file that does not exist fails the deploy ("The
+  // pattern … defined in `functions` doesn't match any Serverless Functions"),
+  // so a renamed handler is a broken deploy, caught here before one; an entry
+  // point with no key silently runs on the platform's default limits; a cron
+  // path with no handler is a scheduled 404 nobody sees.
   test("vercel.json names only entry points that exist, every entry point has its limits, every cron has a handler", () => {
     assert.deepEqual(vercelAgreesWithApi(REPO), []);
   });
@@ -324,32 +527,59 @@ describe("each check bites on a temporary tree", () => {
     assert.deepEqual(offenders(supabaseInPublic(root)), ["public/app.js", "public/config.js", "public/demo.html", "public/meeting.js"]);
   });
 
-  test("[C-1592] a webhook handler that parses the body is caught; reading the stream or bodyParser:false passes", () => {
+  test("[C-1592] a webhook handler that parses the body is caught, even beside a comment or a string about raw bytes; reading the request's stream or bodyParser:false passes", () => {
     const root = tempTree({
       // api/voice.ts is the post-call webhook (SPEC §2), whatever else it serves;
       // api/wa.ts is Meta's, even when it leaves the signature to a _lib file.
-      "api/voice.ts": `export async function POST(req: Request) {\n  const event = await req.json();\n  return new Response("ok");\n}\n`,
+      // A header comment that says the right thing is not the right thing.
+      "api/voice.ts": `// The post-call webhook. Reads the body once with arrayBuffer() and verifies those bytes.\nexport async function POST(req: Request) {\n  const event = await req.json();\n  return new Response("ok");\n}\n`,
       "api/wa.ts": `import { inbound } from "./_lib/wa-inbound.js";\nexport async function POST(req: Request) {\n  return inbound(await req.json(), req.headers);\n}\n`,
       "api/whatsapp-webhook.ts": `import { verifyMeta } from "./_lib/crypto.js";\nexport async function POST(req: Request) {\n  const text = await req.text();\n  verifyMeta(Buffer.from(text), req.headers.get("x-hub-signature-256"), "s");\n}\n`,
+      // A for-await over something else is not the request's stream.
+      "api/sms-webhook.ts": `export async function POST(req: Request) {\n  let n = 0;\n  for await (const page of pages()) n++;\n  return handle(req, n);\n}\n`,
+      // Nor is a string that names the right call.
+      "api/meta-webhook.ts": `export async function POST(req: Request) {\n  console.warn("read req.arrayBuffer() before verifying");\n  return handle(JSON.parse(await req.text()));\n}\n`,
+      // Raw bytes read, and then the body parsed again: the parse is what gets used.
+      "api/twilio-webhook.ts": `export async function POST(req: Request) {\n  const raw = Buffer.from(await req.clone().arrayBuffer());\n  const event = await req.json();\n  return handle(raw, event);\n}\n`,
       "api/resend-webhook.ts": `import { verifyResend } from "./_lib/crypto.js";\nexport async function POST(req: Request) {\n  const raw = Buffer.from(await req.arrayBuffer());\n  verifyResend(raw, { id: "", timestamp: "", signature: "" }, "s");\n}\n`,
       "api/meta.ts": `import { verifyMeta } from "./_lib/crypto.js";\nexport const config = { api: { bodyParser: false } };\nexport default async function handler(req: any) { const chunks = []; for await (const c of req) chunks.push(c); verifyMeta(Buffer.concat(chunks), null, "s"); }\n`,
+      "api/stream-webhook.ts": `export async function POST(request: Request) {\n  const reader = request.body!.getReader();\n  return handle(await drain(reader));\n}\n`,
+      "api/node-webhook.ts": `export default async function handler(req: any) {\n  const chunks: Buffer[] = [];\n  for await (const chunk of req) chunks.push(chunk);\n  return handle(Buffer.concat(chunks));\n}\n`,
       // Not webhooks: the dashboard parses JSON, and a library file is handed bytes by its caller.
       "api/app.ts": `export async function POST(req: Request) { return Response.json(await req.json()); }\n`,
       "api/_lib/post-call.ts": `import { verifyElevenLabs } from "./crypto.js";\nexport function check(raw: Buffer) { return verifyElevenLabs(raw, null, ["s"]); }\n`,
     });
-    assert.deepEqual(offenders(webhooksReadRawBytes(root)), ["api/voice.ts", "api/wa.ts", "api/whatsapp-webhook.ts"]);
+    assert.deepEqual(offenders(webhooksReadRawBytes(root)), [
+      "api/meta-webhook.ts",
+      "api/sms-webhook.ts",
+      "api/twilio-webhook.ts",
+      "api/voice.ts",
+      "api/wa.ts",
+      "api/whatsapp-webhook.ts",
+    ]);
   });
 
-  test("[C-1593] a model call in a webhook handler is caught; the worker may call models", () => {
+  test("[C-1593] a model call in a webhook handler, or in a _lib helper it calls on the request path, is caught; through the queue, or in the worker, it is not", () => {
     const root = tempTree({
       "api/voice.ts": `import { askJSON } from "./_lib/models.js";\nexport async function POST(req: Request) {\n  const raw = Buffer.from(await req.arrayBuffer());\n  const facts = await askJSON<object>("extract", "…", {});\n}\n`,
       "api/resend-webhook.ts": `export async function POST(req: Request) {\n  const raw = Buffer.from(await req.arrayBuffer());\n  const m = await import("./_lib/models.js");\n}\n`,
       "api/whatsapp-webhook.ts": `export async function POST(req: Request) {\n  const raw = Buffer.from(await req.arrayBuffer());\n  await fetch("https://openrouter.ai/api/v1/chat/completions");\n}\n`,
+      // Two hops down, inline: the sender waits on a model all the same.
+      "api/wa.ts": `import { inbound } from "./_lib/inbound.js";\nexport async function POST(req: Request) {\n  return inbound(Buffer.from(await req.arrayBuffer()));\n}\n`,
+      "api/_lib/inbound.ts": `import { db } from "./db.js";\nimport { readFacts } from "./facts.js";\nexport async function inbound(raw: Buffer) { return readFacts(raw); }\n`,
+      "api/_lib/facts.ts": `import { askJSON } from "./models.js";\nexport async function readFacts(raw: Buffer) {\n  return askJSON("extract", raw.toString(), {});\n}\n`,
+      "api/_lib/db.ts": `export const db = () => null;\n`,
+      // Through the queue is job work, whatever the queue's handlers import; a
+      // type from models.ts is erased; a comment about a model call is not one.
+      "api/meta-webhook.ts": `import type { Role } from "./_lib/models.js";\nimport { enqueue } from "./_lib/queue.js";\n// Never askJSON( here: the extract_facts job does it.\nexport async function POST(req: Request) {\n  const raw = Buffer.from(await req.arrayBuffer());\n  await enqueue("extract_facts", null, { bytes: raw.length });\n}\n`,
+      "api/_lib/queue.ts": `import { readFacts } from "./facts.js";\nexport async function enqueue(kind: string, s: null, p: object) {}\n`,
       "api/worker.ts": `import { askJSON } from "./_lib/models.js";\nexport async function POST() { await askJSON("extract", "…", {}); }\n`,
       "api/_lib/extract.ts": `import { askJSON } from "./models.js";\n`,
     });
-    assert.deepEqual(offenders(noModelCallInWebhooks(root)), ["api/resend-webhook.ts", "api/voice.ts", "api/whatsapp-webhook.ts"]);
-    assert.ok(noModelCallInWebhooks(root).some((l) => /^api\/voice\.ts:4: askJSON/.test(l)), noModelCallInWebhooks(root).join("\n"));
+    const found = noModelCallInWebhooks(root);
+    assert.deepEqual(offenders(found), ["api/resend-webhook.ts", "api/voice.ts", "api/wa.ts", "api/whatsapp-webhook.ts"]);
+    assert.ok(found.some((l) => /^api\/voice\.ts:4: askJSON/.test(l)), found.join("\n"));
+    assert.ok(found.some((l) => /^api\/wa\.ts:1: reaches api\/_lib\/facts\.ts:\d+: /.test(l)), found.join("\n"));
   });
 
   test("[C-1439] console.log(body), a raw body in a template or across lines, a logged req.json() are caught; a message about the body is not", () => {
@@ -358,6 +588,8 @@ describe("each check bites on a temporary tree", () => {
       "api/_lib/post-call.ts": `export function bad(rawBody: Buffer) {\n  console.error(\n    "bad event",\n    rawBody.toString("utf8"),\n  );\n}\n`,
       "api/_lib/wa.ts": "export function seen(req: any) {\n  console.warn(`inbound ${req.body}`);\n}\n",
       "api/app.ts": `export async function POST(req: Request) {\n  console.info("action", await req.json());\n}\n`,
+      // The criterion's own grep is console.log(.*body: "body" anywhere in a name counts.
+      "api/_lib/ingest.ts": `export function seen(bodyText: string, bodyJson: unknown, eventBody: string) {\n  console.log("post-call", bodyText);\n  console.warn(bodyJson);\n  console.error(\`event \${eventBody.slice(0, 40)}\`);\n}\n`,
       "api/_lib/ok.ts":
         `export async function fine(bytes: Uint8Array, err: unknown, res: Response) {\n` +
         `  console.warn("post-call: body over the limit", bytes.length);\n` +
@@ -367,9 +599,40 @@ describe("each check bites on a temporary tree", () => {
         `}\n`,
     });
     const found = noBodyInLogs(root);
-    assert.deepEqual(offenders(found), ["api/_lib/post-call.ts", "api/_lib/wa.ts", "api/app.ts", "api/voice.ts"]);
+    assert.deepEqual(offenders(found), ["api/_lib/ingest.ts", "api/_lib/post-call.ts", "api/_lib/wa.ts", "api/app.ts", "api/voice.ts"]);
     assert.ok(found.includes("api/voice.ts:3: console.log"), found.join("\n"));
     assert.ok(found.includes("api/_lib/post-call.ts:2: console.error"), found.join("\n"));
+    for (const line of ["api/_lib/ingest.ts:2: console.log", "api/_lib/ingest.ts:3: console.warn", "api/_lib/ingest.ts:4: console.error"]) {
+      assert.ok(found.includes(line), `${line} not caught:\n${found.join("\n")}`);
+    }
+  });
+
+  test("[C-1527] grep-models exits 1 when a slug literal is added to api/_lib/extract.ts, and passes the same tree without it", () => {
+    const clean = { "api/_lib/env.ts": `export const env = { MODEL: process.env.MODEL ?? "" };\n`, "api/_lib/db.ts": `const ct = "application/json";\n` };
+    assert.equal(slugGrep(tempTree(clean)).status, 0, "the tree is clean before the slug is planted");
+
+    for (const slug of ["meta-llama/llama-3.3-70b-instruct:free", "qwen/qwen3-235b-a22b", "mistralai/mistral-small:free"]) {
+      const planted = slugGrep(tempTree({ ...clean, "api/_lib/extract.ts": `export const MODEL = "${slug}";\n` }));
+      assert.equal(planted.status, 1, `${slug} not caught:\n${planted.out}`);
+      assert.match(planted.out, new RegExp(`api/_lib/extract\\.ts:1:.*${slug.replace(/[.]/g, "\\.")}`));
+    }
+  });
+
+  test("[C-1528] the exemption is HARD_FALLBACKS in api/_lib/models.ts only: not another file named models.ts, not a slug elsewhere in models.ts", () => {
+    const hard = `export const HARD_FALLBACKS: string[] = [\n  "nvidia/nemotron-3-ultra-550b-a55b:free",\n  "google/gemma-4-31b-it:free",\n];\n`;
+    const ok = tempTree({ "api/_lib/models.ts": `// the model layer\n${hard}export const MIN_MAX_TOKENS = 1200;\n` });
+    assert.equal(slugGrep(ok).status, 0, "HARD_FALLBACKS in api/_lib/models.ts is the exemption");
+    assert.equal(slugsOutsideHardFallbacks(ok).status, 0);
+
+    const elsewhere = slugGrep(tempTree({ "api/_lib/old/models.ts": hard, "api/models.ts": hard }));
+    assert.equal(elsewhere.status, 1, "a file merely named models.ts is not exempt");
+    assert.deepEqual(offenders(elsewhere.out.split("\n").filter((l) => l.startsWith("api/"))), ["api/_lib/old/models.ts", "api/models.ts"]);
+
+    const stray = tempTree({ "api/_lib/models.ts": `${hard}const VOICE = "openai/whisper-1";\n` });
+    assert.equal(slugGrep(stray).status, 0, "the script alone exempts the whole file…");
+    const outside = slugsOutsideHardFallbacks(stray);
+    assert.equal(outside.status, 1, "…so a slug beside HARD_FALLBACKS is caught here");
+    assert.match(outside.out, /openai\/whisper-1/);
   });
 
   test("vercel.json: a key for a missing file, an entry point with no key and a cron with no handler are caught", () => {
