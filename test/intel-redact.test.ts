@@ -22,9 +22,21 @@ import { installFakeDb, type FakeDb } from "./_fakes.ts";
 import { SECRET_ENV, redactContacts, redactDeep, redactJson, redactText } from "../api/_lib/intelredact.ts";
 import { __resetIntel, capture, flushIntel, traceForSession, withTrace } from "../api/_lib/intel.ts";
 
-// Built at runtime so no Supabase-key-shaped literal sits in the repo (push protection).
+// Built at runtime so no credential-shaped literal sits in the repo (push
+// protection, secret scanning): Supabase keys, a JWT, vendor keys, a PEM
+// block, a connection string with a password.
 const FAKE_SB_SECRET = ["sb", "secret", "TESTONLYtestonlyTESTONLYtestonly0"].join("_");
 const FAKE_SB_PUBLISHABLE = ["sb", "publishable", "TESTONLYtestonlyTESTON"].join("_");
+const b64url = (json: object): string => Buffer.from(JSON.stringify(json)).toString("base64url");
+const FAKE_JWT = [b64url({ alg: "HS256" }), b64url({ sub: "demo-client" }), "TESTONLYsignature".repeat(2)].join(".");
+const HEX32 = "0123456789abcdef".repeat(2);
+const FAKE_SK_DASH = ["sk", "or", "v1", HEX32].join("-");
+const FAKE_SK_UNDER = ["sk", `${HEX32}01234567`].join("_");
+const FAKE_XI = ["xi", HEX32].join("-");
+const FAKE_PEM_BODY = "TESTONLYnotAkeyTESTONLYnotAkey00";
+const FAKE_PEM = ["-----BEGIN ", "PRIVATE KEY-----\n", FAKE_PEM_BODY, "\nTESTONLYnotAkey11\n", "-----END ", "PRIVATE KEY-----"].join("");
+const FAKE_PG_PASSWORD = "hunter2pass";
+const FAKE_POSTGRES = ["postgres", "://", "postgres.demo", ":", FAKE_PG_PASSWORD, "@", "db.demo.example.test:5432/postgres"].join("");
 
 const S1 = "5e550001-0000-4000-8000-000000000001";
 const CLIENT = "00000000-0000-4000-8000-0000000000c1";
@@ -122,12 +134,12 @@ describe("intelredact: secrets", () => {
   test("[C-1737] a bearer token, a JWT, sk-/xi- keys, a PEM private key, a postgres:// connection string, a Cookie: header and a signed /q/ link are each removed", async () => {
     const pieces = {
       bearer: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
-      jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZW1vLWNsaWVudCJ9.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
-      skDash: "sk-or-v1-0123456789abcdef0123456789abcdef",
-      skUnder: "sk_0123456789abcdef0123456789abcdef01234567",
-      xi: "xi-0123456789abcdef0123456789abcdef",
-      pem: "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nAQEAq1w2e3r4t5y6u7i8o9p0\n-----END PRIVATE KEY-----",
-      postgres: "postgres://postgres.demo:hunter2pass@db.demo.example.test:5432/postgres",
+      jwt: FAKE_JWT,
+      skDash: FAKE_SK_DASH,
+      skUnder: FAKE_SK_UNDER,
+      xi: FAKE_XI,
+      pem: FAKE_PEM,
+      postgres: FAKE_POSTGRES,
       cookie: "Cookie: call_session=s3ss10nvalue0123456789; theme=dark",
       signed: "https://call.test/q/7d9f2c1e-0000-4000-8000-00000000a001?exp=1761900000&sig=9f86d081884c7d659a2feaa0c55ad015",
     };
@@ -137,8 +149,8 @@ describe("intelredact: secrets", () => {
       pieces.skDash,
       pieces.skUnder,
       pieces.xi,
-      "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
-      "hunter2pass",
+      FAKE_PEM_BODY,
+      FAKE_PG_PASSWORD,
       "postgres.demo",
       "s3ss10nvalue0123456789",
       "9f86d081884c7d659a2feaa0c55ad015",
@@ -354,28 +366,28 @@ describe("intelredact: identifiers", () => {
   // Fix round 1 (review I-2, m-1): the written forms of the same numbers.
   test("[C-1739] phone, ID and card numbers written with brackets, dots, double spaces, a word glued on, or read out digit by digit go too", () => {
     const cases = [
-      "phone (082) 123 4567 please",
-      "phone 082.123.4567 please",
-      "phone +27 (0)82 123 4567 please",
+      "phone (079) 993 0001 please",
+      "phone 079.993.0001 please",
+      "phone +27 (0)79 993 0001 please",
       "ID no.8001015009087 please",
       "client x8001015009087 please",
       "id_8001015009087 please",
       "card 4111 1111  1111 1111 please",
       "card 4111 - 1111 - 1111 - 1111 please",
-      "it's 0, 8, 2, 1, 2, 3, 4, 5, 6, 7 please",
+      "it's 0, 7, 9, 9, 9, 3, 0, 0, 0, 1 please",
       "it's 8 0 0 1 0 1 5 0 0 9 0 8 7 please",
-      "it's zero eight two one two three four five six seven please",
+      "it's zero seven nine nine nine three zero zero zero one please",
       "ID 0101 015 009 087 please",
     ];
     for (const c of cases) {
       const out = redactText(c);
       assert.doesNotMatch(out, /\d[\d\s().,-]*\d/, `${c} → ${out}`);
       assert.match(out, /\[(number|contact)\] please$/, `${c} → ${out}`);
-      assert.doesNotMatch(out, /zero|eight|seven/, `${c} → ${out}`);
+      assert.doesNotMatch(out, /zero|seven|nine/, `${c} → ${out}`);
     }
-    assert.equal(redactText("phone (082) 123 4567 please"), "phone [contact] please", "a phone number is contact data");
+    assert.equal(redactText("phone (079) 993 0001 please"), "phone [contact] please", "a phone number is contact data");
     // The same rule as the turn's own redaction (SPEC 7.2) will use: one implementation, so the two agree exactly (C-1743).
-    assert.equal(redactContacts("WhatsApp me on (082) 123 4567 or thandi@example.test"), "WhatsApp me on [contact] or [contact]");
+    assert.equal(redactContacts("WhatsApp me on (079) 993 0001 or thandi@example.test"), "WhatsApp me on [contact] or [contact]");
     assert.equal(redactContacts("ID 8001015009087"), "ID 8001015009087", "redactContacts is contact data only");
   });
 
@@ -387,6 +399,76 @@ describe("intelredact: identifiers", () => {
       "options R1 500 000, R2 000 000 and R3 000 000",
       "between 31.10.2026 and 30.11.2026",
     ]) assert.equal(redactText(text), text);
+  });
+
+  // Phase 0 review (I-1): two amounts joined by a dash, a slash or a bracket
+  // were read as one phone number or one long number. redactContacts is the
+  // rule turns.text uses (SPEC 7.2), and turns.text is what extract_facts
+  // reads and what every fact's backing turn is (R2): a client's stated cover
+  // range must reach it whole.
+  test("[C-1740][C-1743] money ranges and lists survive redactText and redactContacts: a dash, an en dash, a slash, a bracket, 'to', 'and' or commas between amounts", () => {
+    const money = [
+      // The review's probe: each one became [contact] or [number].
+      "cover R1 000 000 - 2 000 000",
+      "family cover 1 000 000 - 3 000 000 rand",
+      "options 1 500 000 – 2 000 000",
+      "R100 000 - 200 000",
+      "R150 000/200 000",
+      "R150 000 (200 000 with spouse)",
+      "income 20 000 - 25 000",
+      "I earn 25 000 - 30 000",
+      // The same with the dash unspaced, in words, as a list, as formatRand writes it, and with no thousands spaces.
+      "income 20 000-25 000 a month",
+      "cover 1 000 000–2 000 000",
+      "R1 000 000 to 2 000 000",
+      "between 1 000 000 and 2 000 000",
+      "expenses 4 500, 3 200, 2 800",
+      "rent 4 500, car 3 200, school fees 2 800 and food 1 900",
+      "R 1 500 000 – R 2 000 000",
+      "R 150 000 / R 200 000",
+      "cover 25 000 000 - 30 000 000 for the business",
+      "cover R 100 000 000 for the business",
+      "income 20000 - 25000",
+      "cover 1000000 - 2000000",
+      "R150000/200000",
+    ];
+    for (const m of money) {
+      assert.equal(redactText(m), m, `redactText: ${m}`);
+      assert.equal(redactContacts(m), m, `redactContacts: ${m}`);
+    }
+    // Phone numbers still go, in every shape they are written in, and beside money.
+    for (const phone of ["0799930001", "079 993 0001", "079  993  0001", "079-993-0001", "079 - 993 - 0001", "079.993.0001", "(079) 993 0001", "+27 79 993 0001", "+27799930001", "27799930001", "+27 (0)79 993 0001", "0027 79 993 0001"]) {
+      assert.equal(redactContacts(`call ${phone} please`), "call [contact] please", `redactContacts: ${phone}`);
+      assert.equal(redactText(`call ${phone} please`), "call [contact] please", `redactText: ${phone}`);
+    }
+    const mixed = "cover R1 000 000 - 2 000 000, WhatsApp (079) 993 0001 or 079.993.0002 - after 5";
+    const stored = "cover R1 000 000 - 2 000 000, WhatsApp [contact] or [contact] - after 5";
+    assert.equal(redactContacts(mixed), stored);
+    assert.equal(redactText(mixed), stored);
+    // And an account, a card or an ID beside money, or written like it, still goes: nine
+    // unmarked digits are an identifier (contract rule 4) however they are grouped, and a
+    // number led by a 0, a card's fours or an ID's 6-4-3 joins across spaced dashes and slashes.
+    assert.equal(redactText("account 6212 345 6789 for the R1 500 debit order"), "account [number] for the R1 500 debit order");
+    assert.equal(redactText("card 4111 1111 1111 1111, premium 1 500 - 2 000"), "card [number], premium 1 500 - 2 000");
+    assert.equal(redactText("my account is 621 234 567"), "my account is [number]");
+    assert.equal(redactText("ID 800101 - 5009 - 087"), "ID [number]");
+    assert.equal(redactText("ID 010101 / 5009 / 087"), "ID [number]");
+    assert.doesNotMatch(redactText("ref 0123/456/789"), /\d/);
+  });
+
+  // Phase 0 review (m-A, Task 0.6 N-2): the PIN/OTP/code rule crossed up to
+  // sixty characters, so money anywhere after the word went.
+  test("[C-1740][C-1742] a PIN, OTP or code is the digits right after the word (a space, a line break, a tag, punctuation or 'is'); money after it stays", () => {
+    for (const text of [
+      "the promo code applies to premiums of R1 500 per month",
+      "the code is R1 500",
+      "the OTP was sent, and the premium is 1 500 a month",
+      "use the code on your statement for the 25 000 - 30 000 income band",
+      "my pin number changed when the cover went to R 1 500 000",
+    ]) assert.equal(redactText(text), text);
+    assert.equal(redactText("my PIN is 4471, for the R1 500 debit order"), "my PIN is [redacted], for the R1 500 debit order");
+    // A phone number after the word "code" is a phone number, whole.
+    assert.equal(redactText("area code 079 993 0001"), "area code [contact]");
   });
 });
 

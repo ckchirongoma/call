@@ -44,7 +44,7 @@ retrofitted.
   custom LLM endpoint through OpenRouter (RESEARCH §3a), every agent turn
   becomes a full `model` row.
 
-## 3. How Call adapts the contract (additive only)
+## 3. How Call adapts the contract (additive, with one departure: the last row)
 
 | Contract | Call |
 |---|---|
@@ -57,6 +57,7 @@ retrofitted.
 | `ask` / `say` | Client and agent turns, captured at ingest with the transcript's own timestamps in `content.t`; WhatsApp in; every email and WhatsApp out. |
 | Broker actions | `track`, actor `person`, channel `dashboard`, `name = "broker:<action>"`, `content.props` {before, after, reason}. This is where corrections live. |
 | Declined consent | The trace keeps the shape only (`content = null`) whatever the switch says: the person refused recording. |
+| §4 rule 1, "serialised at capture" (**a departure, not an addition**) | Small content is serialised at capture. Content over the inline bound (more than 2,000 values or 256 K characters: a catalogue upload, a meeting's segments) is held by reference and serialised, cut and redacted at the flush, so capture stays bounded work on the request path (Task 0.6 review, I-4). A caller passes a finished value and never changes it after `capture()` (`CaptureOptions.content`); Tasks 8.5 and 10.x pass theirs that way. |
 | Telling the person | The agent's first message, the `data_use` disclosure and the meeting consent panel say the call is kept to prepare the recommendation and to improve the service, and that "forget me" deletes it (AGENT-PROMPT §1). |
 
 ## 4. Owner actions

@@ -84,7 +84,14 @@ export interface CaptureOptions {
   actor?: Actor;
   ok?: boolean | null;
   ms?: number | null;
-  /** The words and payloads: dropped in meta mode, redacted always. */
+  /**
+   * The words and payloads: dropped in meta mode, redacted always. Content
+   * over the inline bound (more than 2,000 values or 256 K characters) is held
+   * by reference and read at the flush, not at capture(): pass a finished
+   * value and do not change it afterwards, or the row records the changed
+   * one. This departs from INTEL-CONTRACT §4 rule 1 ("serialised at
+   * capture"), so capture stays bounded work (INTEL-PHASE0 §3).
+   */
   content?: unknown;
   /** Small facts that are never words: model, role, sizes, ids, statuses. */
   meta?: Record<string, unknown>;
@@ -219,8 +226,16 @@ export function captureMode(): CaptureMode {
 const sha16 = (s: string): string => createHash("sha256").update(s).digest("hex").slice(0, 16);
 const TURN_ID = /^t_[0-9a-f]{16}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-/** A trace id as this code makes them (s_<uuid>, job_<n>, r_/p_ + hex), or a short one of the same shape; never words. */
-const TRACE_ID = /^[a-z]{1,8}_[A-Za-z0-9_.:-]{1,100}$/;
+/**
+ * A trace id exactly as this code makes them (INTEL-PHASE0 §3, the contract
+ * §2): s_<uuid>, job_<n>, r_ + 16 hex, t_ + 16 hex. trace_id is never
+ * redacted (toRow passes it through), so anything else is not used: the first
+ * version took any short prefix and id-ish text, and `wa_27799930001` would
+ * have stored a phone number raw (Phase 0 review, m-B). A job number has at
+ * most eight digits for the same reason (nine is a phone number's length);
+ * a job traced by its jobId (traceOf) is not limited.
+ */
+const TRACE_ID = /^(?:s_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|job_[1-9]\d{0,7}|[rt]_[0-9a-f]{16})$/;
 
 /** The one id of everything a session did. */
 export const traceForSession = (sessionId: string): string => `s_${sessionId}`;

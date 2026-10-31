@@ -508,6 +508,22 @@ describe("intel: one id per task", () => {
     assert.equal(row!.name, "named for [contact]");
   });
 
+  // Phase 0 review (m-B): trace_id is never redacted (toRow passes it
+  // through), so it takes only the ids this code makes. wa_<number> was
+  // id-shaped enough before, and an entry point that built a trace from a
+  // phone number would have stored the number raw.
+  test("[C-1711] a trace id is used only as this code makes one: s_<uuid>, job_<n>, r_ or t_ + 16 hex; wa_<number> and the like become the process trace", async () => {
+    const good = [`s_${S1}`, "job_42", "r_0123456789abcdef", "t_0123456789abcdef"];
+    const bad = ["wa_27799930001", "job_27799930001", "s_27799930001", "r_27799930001", "t_0799930001", "r_0123456789abcdef0", "s_not-a-uuid", "x_0123456789abcdef", "job_", "job_4x"];
+    for (const traceId of [...good, ...bad]) await intel.withTrace({ traceId }, async () => intel.capture("track", { name: "probe" }));
+    await intel.flushIntel();
+    const traces = rows().map((r) => r.trace_id);
+    assert.equal(traces.length, good.length + bad.length);
+    assert.deepEqual(traces.slice(0, good.length), good);
+    for (const [i, t] of traces.slice(good.length).entries()) assert.match(t, /^p_[0-9a-f]{16}$/, `${bad[i]} → ${t}`);
+    assert.doesNotMatch(JSON.stringify(rows()), /799930001/);
+  });
+
   test("[C-1716] every row's channel is one of phone, web, meeting, dashboard, email, whatsapp, system", async () => {
     await happyPath();
     for (const channel of CHANNELS) await intel.withTrace({ traceId: intel.requestTraceId(), channel: channel as never }, async () => intel.capture("track", { name: `on_${channel}` }));

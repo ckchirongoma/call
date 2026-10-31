@@ -24,6 +24,11 @@
 //     spaces, a word glued on, read out digit by digit or in words (review
 //     I-2). Rows' ids (uuids) and dates are held aside while the number rules
 //     run, so `…-4000-8000-000000000001` and `2026-10-31 14:30` survive.
+//   - Money is held aside too, and a spaced dash, a slash, a bracket or a
+//     comma ends a number: "cover R1 000 000 - 2 000 000" was read as one
+//     phone number, and turns.text (which extract_facts reads) would have
+//     lost the client's cover range (Phase 0 review, I-1). A PIN, OTP or
+//     code is the token right after its word, never money (review m-A).
 //   - Bytes: any base64 or base64url run longer than 200 characters, or
 //     line-wrapped, becomes `[bytes]` (intel.ts keeps a file as its type and
 //     size before it gets here).
@@ -38,8 +43,8 @@
 //     connection string, password, cookie or signed link.
 //   - Identifiers (contract rule 4): ID, card, account and phone numbers,
 //     email addresses, PINs, OTPs, passwords and sign-in codes. Any run of
-//     nine or more digits goes, so money ("R3,000", "R12 500", "R1 500 000")
-//     and dates stay.
+//     nine or more digits goes; money ("R3,000", "R12 500", "R1 500 000",
+//     "20 000 - 25 000") and dates stay.
 //
 // Pure: no database, no settings module, nothing that can throw outward.
 
@@ -74,6 +79,8 @@ export const SECRET_ENV: readonly string[] = [
 const R = "[redacted]";
 
 type Rule = [RegExp, string | ((match: string, ...groups: string[]) => string)];
+/** A step of the identifier pass: a rule, or a shape to hold aside (and put back at the end) from here on. */
+type Step = Rule | { hold: RegExp };
 
 /** Base64 of real bytes has digits and both cases; a long run of one letter, or a slug, is not a file. */
 const looksLikeBytes = (s: string): boolean => /\d/.test(s) && /[A-Z]/.test(s) && /[a-z]/.test(s);
@@ -154,43 +161,92 @@ const HOLD = (i: number): string => `\uE000${i.toString(26).replace(/[0-9]/g, (d
 const HELD = /\uE000([a-z]+)\uE001/g;
 const unhold = (letters: string): number => parseInt(letters.replace(/[q-z]/g, (c) => String("qrstuvwxyz".indexOf(c))), 26);
 
-// A digit separator inside a number as people write one: a space (or two), a
-// dash, a bracket, a slash, and a dot only between groups of three or four
-// (082.123.4567, 1.500.000), never before a decimal's one or two digits, so
-// R1 500 000.00 and R1 500,50 keep their cents.
-const SEP = String.raw`(?:[ \t\u00a0()/\-–]|\.(?=\d{3,4}(?!\d)))`;
-// The same, for a phone number, which starts in the open.
-const PSEP = String.raw`(?:[ )\-–]|\.(?=\d{3,4}(?!\d)))`;
+// A digit separator inside one number as people write one: one or two
+// spaces, a dash or an en dash with nothing around it (079-993-0001), or a
+// dot between groups of three or four (079.993.0001, 1.500.000), never before
+// a decimal's one or two digits, so R1 500 000.00 and R1 500,50 keep their
+// cents. A spaced dash, a slash, a bracket or a comma is a break between two
+// numbers: "R100 000 - 200 000", "R150 000/200 000" and "R150 000 (200 000
+// with spouse)" are two amounts each. The first version took up to three of
+// any of these as one gap, and read money ranges as phone numbers (Phase 0
+// review, I-1).
+const SEP = String.raw`(?:[ \t\u00a0]{1,2}|[-–](?=\d)|\.(?=\d{3,4}(?!\d)))`;
+// A number that is an identifier by its shape alone (led by a 0, or in a
+// card's groups of four or an ID's 6-4-3) may also be written with spaced
+// dashes or slashes (0123/456/789, 4111 - 1111 - 1111 - 1111,
+// 800101 / 5009 / 087): an amount never has that shape, and is held aside
+// before these rules run anyway.
+const WSEP = String.raw`(?:${SEP}|[ \t\u00a0]{0,2}[-–/][ \t\u00a0]{0,2})`;
+// A phone number's own: spaced dashes, not slashes, so "079 993 0001 /
+// 079 993 0002" is two of them. It ends where its digits stop: a number that
+// goes on across one of these is something longer (an ID led by a 0).
+const PSEP = String.raw`(?:${SEP}|[ \t\u00a0]{1,2}[-–][ \t\u00a0]{1,2})`;
+const PHONE_END = String.raw`(?!${PSEP}?\d)(?!\w)`;
 const DIGIT_WORD = "zero|oh|one|two|three|four|five|six|seven|eight|nine";
 
+// ── Money, held aside ────────────────────────────────────────────
+//
+// An amount as people and formatRand ("R 1 500 000") write it. A grouped
+// amount never starts with 0 (a phone number does) and its groups are three
+// digits each, so a phone's, a card's or an ID's groups (079 993 0001,
+// 4111 1111, 800101 5009 087) are never one: an amount does not start or end
+// inside a longer run of digit groups. Unmarked, it has at most eight digits:
+// nine or more is an identifier (contract rule 4), so "621 234 567" is an
+// account number until a currency says otherwise.
+const CURRENCY = String.raw`(?:R|ZAR|USD|EUR|GBP|US\$|\$|€|£)`;
+const CENTS = String.raw`(?:[.,]\d{1,2}(?!\d))?`;
+const AMOUNT_START = String.raw`(?<![\w.,+]|\d[ \t\u00a0]{1,2})`;
+const AMOUNT_END = String.raw`(?!\d)(?![ \t\u00a0]{1,2}\d)(?![.,]\d)`;
+/** Money with its currency (any size), and unmarked amounts of seven or eight digits: never a PIN, an OTP or a code. */
+const MONEY_SURE = new RegExp(
+  String.raw`${AMOUNT_START}${CURRENCY}[ \u00a0]?(?:[1-9]\d{0,2}(?:(?:[ \u00a0]\d{3}){1,4}|(?:,\d{3}){1,4})|\d{1,9})${CENTS}${AMOUNT_END}` +
+    String.raw`|${AMOUNT_START}[1-9]\d?(?:[ \u00a0]\d{3}){2}${CENTS}${AMOUNT_END}`,
+  "gi",
+);
+/** Unmarked amounts of four to six digits (4 500, 25 000): held only after the PIN rules, since a code can be written "482 913". */
+const MONEY_SHORT = new RegExp(String.raw`${AMOUNT_START}[1-9]\d{0,2}[ \u00a0]\d{3}${CENTS}${AMOUNT_END}`, "gi");
+
 /** Email addresses and phone numbers: `[contact]`, as turns.text stores them (SPEC 7.2). */
-const CONTACT_RULES: Rule[] = [
+const EMAIL_RULES: Rule[] = [
   [/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, "[contact]"],
   [/[\w.+-]+%40[\w-]+(?:\.[\w-]+)+/gi, "[contact]"],
-  // South African: 0XX XXX XXXX, +27 XX XXX XXXX, (0XX) …, +27 (0)XX …, with any of the separators.
-  [new RegExp(String.raw`(?<![\w+(%])(?:(?:\+|00|%2B)?27${PSEP}{0,3}(?:\(0\)${PSEP}{0,3})?|\(0|0)(?:${PSEP}{0,3}\d){9}(?!${PSEP}{0,3}\d)(?!\w)`, "gi"), "[contact]"],
-  // Anywhere else, written with its +.
-  [new RegExp(String.raw`(?<![\w+%])(?:\+|%2B)\d{1,3}(?:${SEP}{0,3}\d){6,13}(?!${PSEP}{0,3}\d)(?!\w)`, "gi"), "[contact]"],
+];
+const PHONE_RULES: Rule[] = [
+  // South African: 0XX XXX XXXX, +27 XX XXX XXXX, 0027 …, +27 (0)XX …, (0XX) XXX XXXX, with any of the separators.
+  [new RegExp(String.raw`(?<![\w+(%])(?:(?:(?:\+|00|%2B)?27${PSEP}?(?:\(0\)${PSEP}?)?|0)(?:${PSEP}?\d){9}|\(0\d{2}\)[ \t\u00a0]{0,2}(?:${PSEP}?\d){7})${PHONE_END}`, "gi"), "[contact]"],
+  // Anywhere else, written with its + (and perhaps a bracketed area code: +44 (0)20 …, (+27) …).
+  [new RegExp(String.raw`(?<![\w+%])(?:\+|%2B)\d{1,3}\)?(?:[ \t\u00a0]{0,2}\(\d{1,4}\))?(?:${SEP}?\d){6,13}${PHONE_END}`, "gi"), "[contact]"],
 ];
 
-/** Identifiers. Run with uuids and dates held aside. */
-const IDENTIFIER_RULES: Rule[] = [
-  ...CONTACT_RULES.slice(0, 2),
-  // PINs, OTPs and sign-in codes: the digits after the word, across a line
-  // break or an HTML tag (an email puts the code in a <p> of its own), or
-  // just before it ("4471 is my pin").
-  [/\b(pin|otp|one[- ]time (?:pin|code|password)|code)\b((?:[^\d<]|<[^>]{0,300}>){0,60}?)\d(?:[ -]?\d){3,7}(?!\d)/gi, `$1$2${R}`],
-  [/(?<![\d])\d(?:[ -]?\d){3,7}(?!\d)(?=[^\d\n]{0,15}\b(?:pin|otp)\b)/gi, R],
-  ...CONTACT_RULES.slice(2),
-  // A number read out digit by digit ("0, 8, 2, 1, …") or in words ("zero eight two …").
+/** Money first, then email addresses and phone numbers: the one rule for turns.text and for capture (C-1743). */
+const CONTACT_STEPS: Step[] = [{ hold: MONEY_SURE }, { hold: MONEY_SHORT }, ...EMAIL_RULES, ...PHONE_RULES];
+
+/** Identifiers. Run with uuids and dates held aside, and money once the PIN rules have had their look. */
+const IDENTIFIER_STEPS: Step[] = [
+  { hold: MONEY_SURE },
+  ...EMAIL_RULES,
+  // PINs, OTPs and sign-in codes: the digits right after the word, across
+  // spaces, a line break, punctuation, an "is" or an HTML tag (an email puts
+  // the code in a <p> of its own), or just before it ("4471 is my pin"). The
+  // first version crossed any sixty characters, so "the promo code applies
+  // to premiums of R1 500" lost its money (Phase 0 review, m-A). A run that
+  // goes on past eight digits is not a code ("area code 079 993 0001").
+  [/\b(pin|otp|one[- ]time (?:pin|code|password)|code)\b((?:[\s:;,.#=*"'()[\]\-–—]|<[^>]{0,300}>|\b(?:is|was)\b){0,20}?)\d(?:[ -]?\d){3,7}(?![ -]?\d)/gi, `$1$2${R}`],
+  [/(?<!\d[ -]?)\d(?:[ -]?\d){3,7}(?![ -]?\d)(?=[^\d\n]{0,15}\b(?:pin|otp)\b)/gi, R],
+  { hold: MONEY_SHORT },
+  ...PHONE_RULES,
+  // A number read out digit by digit ("0, 7, 9, …") or in words ("zero seven nine …").
   [/(?<![\w.,])\d(?!\d)(?:(?:,\s?|\s)\d(?!\d)){8,}/g, "[number]"],
   [new RegExp(String.raw`\b(?:(?:${DIGIT_WORD}|double|triple)[\s,.-]+){8,}(?:${DIGIT_WORD})\b`, "gi"), "[number]"],
   // Thirteen or more digits in a row (an ID, a card) go even with a word glued on (x8001015009087).
   [/(?<!\d)\d{13,19}(?!\d)/g, "[number]"],
+  // A card in groups of four, or an ID in its 6-4-3, spaced dashes and slashes and all.
+  [new RegExp(String.raw`(?<![\w.])(?:\d{4}(?:${WSEP}\d{4}){2,3}(?:${WSEP}\d{1,3})?|\d{6}${WSEP}\d{4}${WSEP}\d{3})(?!${WSEP}?\d)(?!\w)`, "g"), "[number]"],
   // Nine or more digits, however separated: ID, card, account and other
-  // numbers. Money and dates are shorter, or held aside above. Preceded by a
-  // start, a non-word character ("no.", "ID:"), or an escaped \n, \t or \r.
-  [new RegExp(String.raw`(?:(?<!\w)|(?<=\\[ntr]))(?<!\d\.)\+?\d(?:${SEP}{0,3}\d){8,}(?!\w)`, "g"), "[number]"],
+  // numbers (one led by a 0 across slashes and spaced dashes too). Money and
+  // dates are held aside above. Preceded by a start, a non-word character
+  // ("no.", "ID:"), or an escaped \n, \t or \r.
+  [new RegExp(String.raw`(?:(?<!\w)|(?<=\\[ntr]))(?<!\d\.)(?:\+?\d(?:${SEP}?\d){8,}|0(?:${WSEP}?\d){8,})(?!\w)`, "g"), "[number]"],
 ];
 
 function secretValues(): string[] {
@@ -207,19 +263,24 @@ const clean = (s: string): string => s.replace(/\u0000/g, "").replace(/[\uD800-\
 
 const apply = (s: string, rules: Rule[]): string => rules.reduce((t, [re, to]) => t.replace(re, to as string), s);
 
-/** Run `rules` with uuids and dates held aside. Any placeholder already in the input is dropped first, so none can be forged. */
-function withHeld(s: string, rules: Rule[]): string {
+/**
+ * Run `steps` with uuids and dates held aside, and whatever a `hold` step
+ * names from that step on. Any placeholder already in the input is dropped
+ * first, so none can be forged.
+ */
+function withHeld(s: string, steps: Step[]): string {
   const held: string[] = [];
+  const hold = (t: string, re: RegExp): string => t.replace(re, (m) => HOLD(held.push(m) - 1));
   let t = s.replace(HELD, "");
-  for (const re of HOLD_RULES) t = t.replace(re, (m) => HOLD(held.push(m) - 1));
-  t = apply(t, rules);
+  for (const re of HOLD_RULES) t = hold(t, re);
+  for (const step of steps) t = "hold" in step ? hold(t, step.hold) : t.replace(step[0], step[1] as string);
   return held.length ? t.replace(HELD, (_m, letters: string) => held[unhold(letters)] ?? "") : t;
 }
 
 function textWith(input: string, secrets: readonly string[]): string {
   let s = clean(String(input));
   for (const v of secrets) if (s.includes(v)) s = s.split(v).join(R);
-  return withHeld(apply(s, SECRET_RULES), IDENTIFIER_RULES);
+  return withHeld(apply(s, SECRET_RULES), IDENTIFIER_STEPS);
 }
 
 /** Text with every secret and identifier taken out. Never throws. */
@@ -237,7 +298,7 @@ export function redactText(input: string): string {
  */
 export function redactContacts(input: string): string {
   try {
-    return withHeld(clean(String(input)), CONTACT_RULES);
+    return withHeld(clean(String(input)), CONTACT_STEPS);
   } catch {
     return "[unreadable]";
   }

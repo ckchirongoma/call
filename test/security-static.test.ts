@@ -504,11 +504,16 @@ describe("this repository", () => {
   });
 });
 
+// Built at runtime so no credential-shaped literal sits in the repo (push
+// protection, secret scanning): the files these trees write still hold them.
+const FAKE_PUBLISHABLE = ["sb", "publishable", "abc123"].join("_");
+const FAKE_JWT_HEADED = [Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url"), "e30", "x"].join(".");
+
 describe("each check bites on a temporary tree", () => {
   test("[C-1572] SUPABASE_ANON_KEY or a publishable key in api/ is caught; the service role is not", () => {
     const root = tempTree({
       "api/app.ts": `const key = process.env.SUPABASE_ANON_KEY;\n`,
-      "api/_lib/browser.ts": `export const KEY = "sb_publishable_abc123";\n`,
+      "api/_lib/browser.ts": `export const KEY = "${FAKE_PUBLISHABLE}";\n`,
       "api/_lib/env2.ts": `export const k = process.env.SUPABASE_PUBLISHABLE_KEY;\n`,
       "api/_lib/db.ts": `// never the anon key, never the publishable key\nexport const k = process.env.SUPABASE_SERVICE_ROLE_KEY;\n`,
     });
@@ -519,9 +524,9 @@ describe("each check bites on a temporary tree", () => {
   test("[C-1573] a Supabase URL, a key or the client library in public/ is caught; the word Supabase in prose is not", () => {
     const root = tempTree({
       "public/demo.html": `<script>fetch("https://abcdefghijklmnopqrst.supabase.co/rest/v1/calls")</script>\n`,
-      "public/app.js": `const key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.x";\n`,
+      "public/app.js": `const key = "${FAKE_JWT_HEADED}";\n`,
       "public/meeting.js": `import { createClient } from "https://esm.sh/@supabase/supabase-js@2";\n`,
-      "public/config.js": `window.KEY = "sb_publishable_abc123";\n`,
+      "public/config.js": `window.KEY = "${FAKE_PUBLISHABLE}";\n`,
       "public/index.html": `<p>Recorded, stored and costed. Built on Supabase and Vercel.</p>\n`,
     });
     assert.deepEqual(offenders(supabaseInPublic(root)), ["public/app.js", "public/config.js", "public/demo.html", "public/meeting.js"]);
