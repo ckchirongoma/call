@@ -335,7 +335,7 @@ describe("fake database", () => {
       try {
         // Every row has the same keys: supabase-js sends a batch's union of keys, and PostgREST fills a gap with NULL.
         await db().from("jobs").insert([
-          job({ dedupe_key: "later", run_after: "2026-10-31T08:03:00.000Z", status: "queued" }), // not runnable yet
+          job({ dedupe_key: "later", run_after: "2026-10-31T08:01:30.000Z", status: "queued" }), // not runnable yet
           job({ dedupe_key: "second", run_after: "2026-10-31T07:30:00.000Z", status: "queued" }),
           job({ dedupe_key: "first", run_after: "2026-10-31T07:00:00.000Z", status: "queued" }),
           job({ dedupe_key: "done", run_after: "2026-10-31T06:00:00.000Z", status: "done" }),
@@ -355,17 +355,47 @@ describe("fake database", () => {
         const c = await db().rpc("claim_job", { p_worker: "w3" });
         assert.deepEqual(c.data, []);
 
-        // Time passing makes the future job runnable (the two running jobs are only 4 minutes into their lock).
-        clock.advance(4 * 60_000);
+        // Time passing makes the future job runnable (the two running jobs are only 100 s into their lock).
+        clock.advance(100_000);
         const d = await db().rpc("claim_job", { p_worker: "w4" });
         assert.equal(d.data[0].dedupe_key, "later");
 
-        // A job whose worker died more than five minutes ago is claimable again, oldest first.
-        clock.advance(6 * 60_000);
+        // A job whose worker died more than 120 s ago (queue.ts LOCK_TIMEOUT_MS) is claimable again, oldest first.
+        clock.advance(20_000);
+        assert.deepEqual((await db().rpc("claim_job", { p_worker: "w5" })).data, [], "exactly 120 s is not yet stale");
+        clock.advance(1);
         const e = await db().rpc("claim_job", { p_worker: "w5" });
         assert.equal(e.data.length, 1);
         assert.equal(e.data[0].dedupe_key, "first");
         assert.equal(e.data[0].attempts, 2);
+      } finally {
+        clock.restore();
+      }
+    });
+
+    test("never hands out a job ahead of an earlier queued or running job of its own session; other sessions and session-less jobs are not held", async () => {
+      const clock = fakeClock("2026-10-31T08:00:00.000Z");
+      try {
+        const s1 = "00000000-0000-4000-8000-0000000000a1";
+        const s2 = "00000000-0000-4000-8000-0000000000a2";
+        await db().from("jobs").insert([
+          job({ dedupe_key: "s1-first", session_id: s1, run_after: "2026-10-31T08:00:30.000Z" }), // not due yet, still first in line
+          job({ dedupe_key: "s1-second", session_id: s1, run_after: "2026-10-31T07:00:00.000Z" }),
+          job({ dedupe_key: "s2-first", session_id: s2, run_after: "2026-10-31T07:30:00.000Z" }),
+          job({ dedupe_key: "s2-second", session_id: s2, run_after: "2026-10-31T07:00:00.000Z" }),
+          job({ dedupe_key: "none", session_id: null, run_after: "2026-10-31T07:45:00.000Z" }),
+        ]);
+        const claim = async (w: string) => ((await db().rpc("claim_job", { p_worker: w })).data as any[]).map((r) => r.dedupe_key);
+        assert.deepEqual(await claim("w1"), ["s2-first"], "s1-second and s2-second are behind their sessions' first jobs");
+        assert.deepEqual(await claim("w2"), ["none"]);
+        assert.deepEqual(await claim("w3"), [], "s2-second waits while s2-first runs");
+        clock.advance(30_000);
+        assert.deepEqual(await claim("w4"), ["s1-first"]);
+        assert.deepEqual(await claim("w5"), []);
+        // A finished (or failed, skipped, cancelled) earlier job holds nothing back.
+        await db().from("jobs").update({ status: "failed" }).eq("dedupe_key", "s1-first");
+        await db().from("jobs").update({ status: "done" }).eq("dedupe_key", "s2-first");
+        assert.deepEqual((await claim("w6")).concat(await claim("w7")).sort(), ["s1-second", "s2-second"]);
       } finally {
         clock.restore();
       }

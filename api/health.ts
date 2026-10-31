@@ -22,6 +22,7 @@
 // names or values.
 
 import { db } from "./_lib/db.js";
+import { alertsConfigured } from "./_lib/email.js";
 import { env, type StringEnvName } from "./_lib/env.js";
 
 type ServiceState = "configured" | "unconfigured";
@@ -101,6 +102,10 @@ export async function GET(req: Request): Promise<Response> {
     // Tasks 4.3 and 6.2). Said plainly, never implied: Task 11.2 makes this
     // true only when Jev or the checker/safety rows are usable (C-1530).
     guardrails_live: false,
+    // Whether a failure can reach a human by email (a Resend key and a valid
+    // ALERT_EMAIL_TO, alerts.ts). Unconfigured, every alert is still an
+    // incident row, shown on /admin (C-1548).
+    alerts: alertsConfigured() ? "configured" : "unconfigured",
   };
   return json(body, body.ok ? 200 : 503);
 }

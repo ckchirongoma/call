@@ -4,6 +4,9 @@
   "functions": {
     "api/health.ts": {
       "maxDuration": 15
+    },
+    "api/worker.ts": {
+      "maxDuration": 300
     }
   },
   "headers": [

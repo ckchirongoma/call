@@ -44,6 +44,8 @@
 // added modelReply() (a chat reply with any finish_reason and usage), the
 // bump_incident rpc (track.ts counts incidents through it), and failTable() (a
 // table that answers every query with an error: "model_config is unreadable").
+// Task 0.4 gave claim_job Call's semantics: a 120-second lock timeout, and no
+// job handed out ahead of an unfinished earlier job of its own session.
 
 // Must be first: api/_lib/env.ts snapshots process.env when it is first imported,
 // and importing the fakes imports api/_lib/db.ts which imports it.
@@ -551,7 +553,8 @@ export interface FakeDb {
   restore(): void;
 }
 
-const STALE_LOCK_MS = 300_000;
+/** claim_job's lock timeout (queue.ts LOCK_TIMEOUT_MS): a running job untouched this long is a dead worker's. */
+const STALE_LOCK_MS = 120_000;
 
 /** Build a fake database without installing it. */
 export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
@@ -928,11 +931,15 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
 
   /**
    * claim_job(p_worker): the oldest runnable job, marked running. Mirrors
-   * Charlie's db/0013 minus its per-owner ordering; Task 0.4 / 1.1 own Call's
-   * real function and update this when it differs. Runnable = queued and due,
-   * or running with a lock more than five minutes old (its worker died). As in
-   * SQL, a comparison with NULL is not true: a NULL run_after is never due, a
-   * NULL locked_at never stale.
+   * Charlie's db/0013 (per-owner order) with Call's session in place of the
+   * owner and a 120-second lock timeout (Task 0.4; Task 1.1 writes the SQL to
+   * match, plan notes). Runnable = queued and due, or running with a lock more
+   * than 120 s old (its worker died). And never ahead of its own session: a
+   * job is claimable only when no earlier job (lower id) of the same session
+   * is still queued or running, so one session's steps run one at a time, in
+   * the order they were queued, however many workers claim at once; a job
+   * with no session waits for nothing. As in SQL, a comparison with NULL is
+   * not true: a NULL run_after is never due, a NULL locked_at never stale.
    */
   const claimJob = (args: Record<string, unknown>): Row[] => {
     const now = Date.now();
@@ -945,7 +952,9 @@ export function makeFakeDb(seed: Record<string, Row[]> = {}): FakeDb {
       const at = ms(j.locked_at);
       return at !== null && now - at > STALE_LOCK_MS;
     };
-    const runnable = tables.jobs.filter((j) => (j.status === "queued" && due(j)) || (j.status === "running" && stale(j)));
+    const behindItsSession = (j: Row): boolean =>
+      !isNil(j.session_id) && tables.jobs.some((o) => o.session_id === j.session_id && o.id < j.id && (o.status === "queued" || o.status === "running"));
+    const runnable = tables.jobs.filter((j) => ((j.status === "queued" && due(j)) || (j.status === "running" && stale(j))) && !behindItsSession(j));
     runnable.sort((a, b) => (ms(a.run_after) ?? Infinity) - (ms(b.run_after) ?? Infinity) || (order.get(a) ?? 0) - (order.get(b) ?? 0));
     const job = runnable[0];
     if (!job) return [];
