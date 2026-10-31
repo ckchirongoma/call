@@ -1,0 +1,35 @@
+--- /tmp/claude-0/-home-user/ad36b136-336a-55d6-81b9-100e21138cdd/scratchpad/rr4/H/api/_lib/figures.ts	2026-10-31 10:46:00.607025633 +0000
++++ /tmp/claude-0/-home-user/ad36b136-336a-55d6-81b9-100e21138cdd/scratchpad/rr4/M/api/_lib/figures.ts	2026-10-31 10:54:09.422053588 +0000
+@@ -1156,7 +1156,7 @@
+   };
+   /** "until I turn 65", "when I'll be 60", "in 10 years I'll be 52", "I'll be 65 when the bond ends", "I'll be 50 in ten years": not now. */
+   const notNow = (j: number, p?: Phrase) =>
+-    [j - 1, j - 2, j - 3].some((x) => NOT_NOW_BEFORE_TURN.has(w(x)) || YEARS_WORD.has(w(x))) ||
++    [j - 1, j - 2, j - 3].some((x) => NOT_NOW_BEFORE_TURN.has(w(x)) || YEARS_WORD.has(w(x)) || (w(x) === "at" && ["that", "this", "which", "what", "the"].includes(w(x + 1)))) ||
+     (p !== undefined && (LATER_AFTER.has(w(p.end)) || (w(p.end) === "in" && ps.some((q) => q.start === p.end + 1 && YEARS_WORD.has(w(q.end))))));
+ 
+   // "born in 1984", "I was born in nineteen eighty-four".
+@@ -1346,6 +1346,7 @@
+  * but "dead broke", "dead tired" and "dead set on cover" are the living. Read
+  * as a death, "my wife and two kids, dead broke" dropped the whole household.
+  */
++const DEAD_IDIOM = new Set(["broke", "tired", "set", "serious", "sure", "keen", "certain", "right", "wrong", "against", "beat", "bored", "scared", "worried", "quiet", "slow", "busy", "poor", "lucky", "honest", "cheap", "easy", "simple", "straight", "ahead", "even", "centre", "center", "end", "heat", "weight", "flat", "cold", "asleep", "exhausted", "stuck", "keen"]);
+ const DEAD_ENDS = new Set([...LATE_ENDS, "for", "after", "at", "from", "of", "when", "by", "long", "a", "too", "as", "to"]);
+ /** "No longer with us" is a death; "no longer with the company" is a job. */
+ const WITH_US = new Set(["us", "me", "them", "you"]);
+@@ -1483,12 +1484,13 @@
+     const w = wordAt(toks, c);
+     const next = wordAt(toks, c + 1);
+     const after2 = wordAt(toks, c + 2);
++    const handedTo = (from: number) => { for (let q = from; q < toks.length && toks[q].k !== "p"; q++) if (wordAt(toks, q) === "to" && ["me", "us", "him", "her", "them", "my", "our", "his", "the", "you"].includes(wordAt(toks, q + 1)) && wordAt(toks, q - 1) !== "way") return true; return false; };
+     const cue =
+       (DEAD_AFTER.has(w) &&
+         !(w === "passed" && PASSED_NOT_DEATH.has(next)) &&
+         // "passed on the house to us" — but "passed on the 5th" is the day they died.
+-        !(w === "passed" && next === "on" && PASSED_ON_OBJECT.has(after2) && !(after2 === "the" && phraseStarting.has(c + 3))) &&
+-        !(w === "dead" && toks[c + 1] && toks[c + 1].k === "w" && !DEAD_ENDS.has(next) && !phraseStarting.has(c + 1)) &&
++        !(w === "passed" && next === "on" && PASSED_ON_OBJECT.has(after2) && !(after2 === "the" && phraseStarting.has(c + 3)) && handedTo(c + 3)) &&
++        !(w === "dead" && DEAD_IDIOM.has(next)) &&
+         // "My wife and two kids, died laughing": the idiom, not a death.
+         !(w === "died" && next === "laughing")) ||
+       (w === "late" && ["is", "was", "are", "were"].includes(wordAt(toks, c - 1)) && (!toks[c + 1] || toks[c + 1].k === "p" || LATE_ENDS.has(next))) ||

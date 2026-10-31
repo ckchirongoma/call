@@ -1,0 +1,6 @@
+### Task 4.1: Conversation fixtures and the scripted-conversation format
+
+**Files:** Create `test/fixtures/conversations/*.json` — the 40 named in SPEC §14 (happy-path, declined-consent, unclear-consent, dropped, silence, misheard-age, hardship, hardship-missed, what-do-you-offer, offers-id-number, someone-elses-cover, hypothetical-cover, negated-cover, two-needs-over-budget, known-client, web-no-caller-id, prompt-injection, afrikaans-money, approximate-figures, long-story, interrupted, medical-detail, agent-advised, agent-priced, no-channel, whatsapp-channel, email-channel, callback-request, budget-unknown, group-cover, replacement-funeral, no-product-fits, age-70, smoker, self-employed, retired, student, meeting (speaker-labelled), meeting-unknown-speakers, second-call-correction), `test/fixtures/README.md` describing the format `{ id, mode, caller_id, turns: [{role, text, t, tool_calls?, flags?}], expect: {...} }`, `test/fixtures.test.ts` (every fixture parses; ids unique; every §3 question stem appears in happy-path).
+
+- [ ] **Step 1: Failing test** `fixtures.test.ts` `[C-1429][C-1430][C-1431][C-1432]` sweep (runs `redact` + later `factUpdates` over all fixtures — the facts part is enabled in Task 4.2). **Step 2–4.** **Step 5: Commit** `Forty scripted conversations the whole pipeline is tested on`
+
