@@ -524,7 +524,7 @@ Every button is a `POST /app/actions` with `action=<id>` and a CSRF token
 
 ---
 
-## 14. Testing strategy (how 1,100 criteria get tested)
+## 14. Testing strategy (how 1,264 criteria get tested)
 
 - **Fakes** (`test/_fakes.ts`, ported and extended): in-memory Supabase (query shapes used here; unsupported shapes throw), fake Storage, scripted model gateway keyed on prompt markers, fake Resend, fake Meta, an **ElevenLabs event factory** that builds signed `post_call_transcription` / `post_call_audio` requests from a scripted conversation, and a fake clock.
 - **Scripted conversations** (`test/fixtures/conversations/*.json`): 40 transcripts covering every journey in §3 and every refusal in §7.3 — the happy path, dropped call, declined consent, misheard-then-corrected age, hardship, "what do you offer", identifier offered by the client, someone else's cover, hypothetical cover, negated cover, two needs over budget, known client second call, in-person meeting, web session without caller id, silence, prompt injection in a client turn, Afrikaans/isiZulu words for money, approximate figures.
