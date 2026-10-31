@@ -10,11 +10,17 @@
 //   - jsonb columns are `unknown` until a module that owns the shape narrows them;
 //   - a nullable column is `| null`. SPEC §4 does not mark NOT NULL, so Task 1.1's
 //     migrations are the authority; where they differ from this file, change this
-//     file in the same commit. The fake database (test/_fakes.ts) is schemaless,
-//     so these types and test/rls.test.ts are the only schema guards.
+//     file in the same commit.
+//
+// The fake database (test/_fakes.ts) takes its column names from here: its
+// COLUMNS list must match these interfaces exactly (the typecheck fails
+// otherwise), its JSONB list is the columns typed `unknown` or `Record`, and a
+// query naming any other column throws. Its DEFAULTS are the migration's
+// defaults for the non-null columns below; change both with the migration.
 //
 // Every table has created_at (C-1580); audit_log also has `at`, and
-// intel_events has `at` and no created_at (INTEL-CONTRACT §1 says "exactly").
+// intel_events has `at` (default now()) and `seq`, and no created_at: the
+// contract's columns are exact (INTEL-CONTRACT §1).
 
 // ── Closed value sets ────────────────────────────────────────────
 

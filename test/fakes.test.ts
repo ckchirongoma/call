@@ -32,6 +32,15 @@ const rowsOf = (res: { data: unknown; error: unknown }): any[] => {
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
+/** The call throws FakeDbUnsupported, and the message names the shape (matches `re`). */
+const refused = (fn: () => unknown, re: RegExp): void => {
+  assert.throws(fn, (e: unknown) => {
+    assert.ok(e instanceof FakeDbUnsupported, `expected FakeDbUnsupported, got ${String(e)}`);
+    assert.match(e.message, re);
+    return true;
+  });
+};
+
 describe("fake database", () => {
   let fake: FakeDb;
   beforeEach(() => {
@@ -323,10 +332,11 @@ describe("fake database", () => {
     test("claims the oldest queued runnable job, marks it running, and returns nothing when none is left", async () => {
       const clock = fakeClock("2026-10-31T08:00:00.000Z");
       try {
+        // Every row has the same keys: supabase-js sends a batch's union of keys, and PostgREST fills a gap with NULL.
         await db().from("jobs").insert([
-          job({ dedupe_key: "later", run_after: "2026-10-31T08:03:00.000Z" }), // not runnable yet
-          job({ dedupe_key: "second", run_after: "2026-10-31T07:30:00.000Z" }),
-          job({ dedupe_key: "first", run_after: "2026-10-31T07:00:00.000Z" }),
+          job({ dedupe_key: "later", run_after: "2026-10-31T08:03:00.000Z", status: "queued" }), // not runnable yet
+          job({ dedupe_key: "second", run_after: "2026-10-31T07:30:00.000Z", status: "queued" }),
+          job({ dedupe_key: "first", run_after: "2026-10-31T07:00:00.000Z", status: "queued" }),
           job({ dedupe_key: "done", run_after: "2026-10-31T06:00:00.000Z", status: "done" }),
         ]);
 
@@ -371,6 +381,256 @@ describe("fake database", () => {
   });
 });
 
+// Each test below is a query the fake used to answer when the real client
+// would have refused it or answered differently, so a broken call site passed.
+describe("fake database: refuses what Supabase would refuse", () => {
+  let fake: FakeDb;
+  beforeEach(() => {
+    fake = installFakeDb();
+  });
+  afterEach(() => fake.uninstall());
+
+  const addBroker = async (): Promise<string> => {
+    const { data, error } = await db().from("brokers").insert({ name: "Demo Broker" }).select().single();
+    assert.equal(error, null);
+    return data.id;
+  };
+
+  test("a filter or order column is a known column or col->>key on a jsonb column; any other shape, or a typo, throws", async () => {
+    await db().from("jobs").insert([
+      { kind: "send_quote", payload: { quoteId: "q1" } },
+      { kind: "send_quote", payload: { quoteId: "q2" } },
+    ]);
+    // JSON keys are case-sensitive, and camelCase is a legal key.
+    assert.equal(rowsOf(await db().from("jobs").select("id").eq("payload->>quoteId", "q1")).length, 1);
+    const ordered = await db().from("jobs").select("payload").order("payload->>quoteId", { ascending: false });
+    assert.deepEqual(rowsOf(ordered).map((r) => r.payload.quoteId), ["q2", "q1"]);
+
+    // `->` yields jsonb, not text: `is("payload->quote_id", null)` is true only where the key is absent. Not faked.
+    refused(() => db().from("jobs").select("id").is("payload->quote_id", null), /payload->quote_id/);
+    refused(() => db().from("jobs").select("id").order("payload->quote_id"), /payload->quote_id/);
+    refused(() => db().from("jobs").select("id").eq("payload->a->>b", "x"), /payload->a->>b/);
+    refused(() => db().from("jobs").select("id").eq("id::text", "1"), /id::text/);
+    // ->> on a text column is an operator error in Postgres (42883), not "no rows".
+    refused(() => db().from("jobs").select("id").eq("kind->>x", "y"), /kind->>x/);
+    refused(() => db().from("jobs").select("id").eq("nope->>x", "y"), /nope/);
+
+    // A typo is loud (PostgREST: 42703 / PGRST204), never "a missing column matches nothing".
+    refused(() => db().from("jobs").select("id").is("lockd_at", null), /"lockd_at" is not a column of jobs/);
+    refused(() => db().from("jobs").select("id").order("run_afer"), /run_afer/);
+    refused(() => db().from("jobs").select("id").in("staus", ["queued"]), /staus/);
+    refused(() => db().from("jobs").select("id").not("lockd_at", "is", null), /lockd_at/);
+    refused(() => db().from("jobs").select("id,lockd_at"), /lockd_at/);
+    refused(() => db().from("jobs").insert({ kind: "x", payload: {}, lockd_at: null }), /lockd_at/);
+    refused(() => db().from("jobs").update({ lockd_at: null }).eq("id", 1), /lockd_at/);
+    refused(() => db().from("jobs").upsert({ kind: "x", payload: {}, lockd_at: null }), /lockd_at/);
+    // intel_events has `at`, never created_at (INTEL-CONTRACT §1 is exact).
+    refused(() => db().from("intel_events").select("id").order("created_at"), /created_at/);
+    refused(() => installFakeDb({ brokers: [{ nmae: "Demo Broker" }] }), /nmae/);
+  });
+
+  test("builder options the fake does not implement throw; nullsFirst is honoured", async () => {
+    const session_id = "00000000-0000-4000-8000-0000000000dd";
+    for (let idx = 0; idx < 4; idx++) {
+      await db().from("turns").insert({ session_id, idx, role: "client", text: `t${idx}`, t_start_secs: idx === 1 ? null : idx });
+    }
+    const idxs = (res: { data: unknown; error: unknown }) => rowsOf(res).map((r) => r.idx);
+    const turns = () => db().from("turns").select("idx").eq("session_id", session_id);
+    assert.deepEqual(idxs(await turns().order("t_start_secs", { nullsFirst: true })), [1, 0, 2, 3]);
+    assert.deepEqual(idxs(await turns().order("t_start_secs", { ascending: false, nullsFirst: false })), [3, 2, 0, 1]);
+    // undefined means the Postgres default: NULLS LAST ascending, NULLS FIRST descending.
+    assert.deepEqual(idxs(await turns().order("t_start_secs", { nullsFirst: undefined })), [0, 2, 3, 1]);
+
+    refused(() => turns().order("idx", { referencedTable: "sessions" } as any), /referencedTable/);
+    refused(() => turns().order("idx", { foreignTable: "sessions" } as any), /foreignTable/);
+    refused(() => turns().limit(1, { referencedTable: "sessions" }), /referencedTable/);
+    refused(() => turns().range(0, 1, { referencedTable: "sessions" }), /referencedTable/);
+    refused(() => db().from("turns").select("*", { count: "planned" }), /planned/);
+    refused(() => db().from("turns").select("*", { count: "estimated" }), /estimated/);
+    refused(() => db().from("turns").select("*", { bogus: true } as any), /bogus/);
+    refused(() => db().from("brokers").insert({ name: "x" }, { count: "exact" }), /count/);
+    refused(() => db().from("brokers").upsert({ name: "x" }, { count: "exact" }), /count/);
+    refused(() => db().from("brokers").upsert({ name: "x" }, { onConflict: "id", bogus: 1 } as any), /bogus/);
+    refused(() => db().from("brokers").update({ name: "x" }, { count: "exact" }), /count/);
+    refused(() => db().from("brokers").delete({ count: "exact" }), /count/);
+    // After a write, supabase-js's select() takes no options: a count asked for there never comes back.
+    refused(() => (db().from("brokers").insert({ name: "x" }) as any).select("*", { count: "exact" }), /select/);
+    assert.equal(fake.tables.brokers.length, 0);
+  });
+
+  test("a batch whose rows have different keys is refused unless defaultToNull is false (PostgREST fills a gap with NULL, not the default)", async () => {
+    const mixed = [{ kind: "a", payload: {} }, { kind: "b", payload: {}, status: "done" }];
+    refused(() => db().from("jobs").insert(mixed), /defaultToNull/);
+    refused(() => db().from("jobs").upsert(mixed), /defaultToNull/);
+    // With defaultToNull: false supabase-js sends `missing=default`, so the gap gets the column default.
+    const res = await db().from("jobs").insert(mixed, { defaultToNull: false }).select("kind,status");
+    assert.deepEqual(rowsOf(res).map((r) => r.status), ["queued", "done"]);
+  });
+
+  test("rpc() is a builder: nothing runs until awaited, single()/maybeSingle() work, and anything else throws naming the shape", async () => {
+    const clock = fakeClock("2026-10-31T08:00:00.000Z");
+    try {
+      await db().from("jobs").insert({ kind: "ingest_transcript", payload: {}, run_after: "2026-10-31T07:00:00.000Z" });
+      const notAwaited = db().rpc("claim_job", { p_worker: "w0" });
+      void notAwaited;
+      assert.equal(fake.tables.jobs[0]!.status, "queued");
+      assert.equal(fake.log.filter((q) => q.op === "rpc").length, 0);
+
+      const one = await db().rpc("claim_job", { p_worker: "w1" }).single();
+      assert.equal(one.error, null);
+      assert.equal((one.data as any).status, "running");
+      assert.equal((one.data as any).locked_by, "w1");
+      const none = await db().rpc("claim_job", { p_worker: "w2" }).maybeSingle();
+      assert.deepEqual({ data: none.data, error: none.error }, { data: null, error: null });
+      const missing = await db().rpc("claim_job", { p_worker: "w2" }).single();
+      assert.equal(missing.error?.code, "PGRST116");
+      assert.deepEqual(fake.log.filter((q) => q.op === "rpc").map((q) => q.args), [{ p_worker: "w1" }, { p_worker: "w2" }, { p_worker: "w2" }]);
+
+      refused(() => db().rpc("claim_job", { p_worker: "w3" }).select("id"), /rpc\("claim_job"\)\.select/);
+      refused(() => db().rpc("claim_job", { p_worker: "w3" }).eq("id", 1), /rpc\("claim_job"\)\.eq/);
+      // A misspelt argument is PGRST202 (no such function signature) in production.
+      refused(() => db().rpc("claim_job", { p_wroker: "w3" }), /p_wroker/);
+      refused(() => db().rpc("claim_job", { p_worker: "w3" }, { count: "exact" }), /count/);
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("an upsert batch is one statement: a repeated conflict key is 21000, and any failure applies nothing", async () => {
+    const broker_id = await addBroker();
+    const onConflict = "broker_id,phone_e164";
+    const { data: one } = await db().from("clients").insert({ broker_id, phone_e164: "+27799930301", first_name: "One" }).select().single();
+    const { data: other } = await db().from("clients").insert({ broker_id, phone_e164: "+27799930302", first_name: "Two" }).select().single();
+
+    const twice = await db().from("clients").upsert(
+      [
+        { broker_id, phone_e164: "+27799930303", first_name: "a" },
+        { broker_id, phone_e164: "+27799930303", first_name: "b" },
+      ],
+      { onConflict },
+    );
+    assert.equal(twice.error?.code, "21000");
+    assert.equal(fake.tables.clients.length, 2);
+
+    // Row 1 would update "One"; row 2 takes an id that is already used. Postgres applies neither.
+    const broken = await db().from("clients").upsert(
+      [
+        { id: one.id, broker_id, phone_e164: "+27799930301", first_name: "One changed" },
+        { id: other.id, broker_id, phone_e164: "+27799930304", first_name: "Clash" },
+      ],
+      { onConflict },
+    );
+    assert.equal(broken.error?.code, "23505");
+    assert.deepEqual(fake.tables.clients.map((c) => c.first_name), ["One", "Two"]);
+
+    // ON CONFLICT DO NOTHING: the second of two equal keys is skipped, not an error.
+    const skipped = await db().from("clients").upsert(
+      [
+        { broker_id, phone_e164: "+27799930305", first_name: "first" },
+        { broker_id, phone_e164: "+27799930305", first_name: "second" },
+      ],
+      { onConflict, ignoreDuplicates: true },
+    ).select();
+    assert.deepEqual(rowsOf(skipped).map((r) => r.first_name), ["first"]);
+    assert.equal(fake.tables.clients.length, 3);
+
+    // One UPDATE that gives two rows the same unique value fails whole, too.
+    await db().from("sessions").insert([
+      { broker_id, mode: "call", provider: "elevenlabs", conversation_id: "conv_1" },
+      { broker_id, mode: "call", provider: "elevenlabs", conversation_id: "conv_2" },
+    ]);
+    const same = await db().from("sessions").update({ conversation_id: "conv_x" }).eq("broker_id", broker_id);
+    assert.equal(same.error?.code, "23505");
+    assert.deepEqual(fake.tables.sessions.map((s) => s.conversation_id), ["conv_1", "conv_2"]);
+  });
+
+  test("an explicit id on a generated-always identity table (jobs, intel_events) is 428C9 and writes nothing", async () => {
+    const job = await db().from("jobs").insert({ id: 999, kind: "x", payload: {} });
+    assert.equal(job.error?.code, "428C9");
+    const event = { id: 5, app: "call", trace_id: "t_demo", kind: "track", name: "demo", actor: "system" };
+    assert.equal((await db().from("intel_events").insert(event)).error?.code, "428C9");
+    assert.equal((await db().from("jobs").upsert({ id: 1, kind: "x", payload: {} })).error?.code, "428C9");
+    assert.equal(fake.tables.jobs.length + fake.tables.intel_events.length, 0);
+
+    const { data: real } = await db().from("jobs").insert({ kind: "x", payload: {} }).select().single();
+    const moved = await db().from("jobs").update({ id: 7 }).eq("id", real.id);
+    assert.equal(moved.error?.code, "428C9");
+    assert.equal(fake.tables.jobs[0]!.id, real.id);
+  });
+
+  test("an undefined filter value throws, and so does null anywhere but is() (PostgREST would compare with the text 'null')", () => {
+    const clients = () => db().from("clients").select("*");
+    refused(() => clients().eq("id", undefined as any), /undefined/);
+    refused(() => clients().in("id", ["00000000-0000-4000-8000-000000000001", undefined]), /undefined/);
+    refused(() => clients().is("forgotten_at", undefined as any), /undefined/);
+    refused(() => clients().not("forgotten_at", "is", undefined), /undefined/);
+    refused(() => clients().eq("forgotten_at", null as any), /is\(/);
+    refused(() => clients().neq("forgotten_at", null), /is\(/);
+    refused(() => clients().gte("created_at", null as any), /is\(/);
+    refused(() => clients().in("id", [null]), /is\(/);
+    // is() takes null, true or false, nothing else.
+    refused(() => clients().is("forgotten_at", "yes" as any), /is\(/);
+    assert.equal(fake.log.length, 0);
+  });
+
+  test("claim_job treats a NULL run_after or locked_at as SQL does: never due, never stale; a plain insert gets run_after by default", async () => {
+    const clock = fakeClock("2026-10-31T08:00:00.000Z");
+    try {
+      await db().from("jobs").insert({ kind: "x", payload: {}, dedupe_key: "null-run-after", run_after: null });
+      await db().from("jobs").insert({ kind: "x", payload: {}, dedupe_key: "null-lock", status: "running", locked_at: null });
+      clock.advance(60 * 60_000);
+      assert.deepEqual((await db().rpc("claim_job", { p_worker: "w1" })).data, []);
+
+      const { data } = await db().from("jobs").insert({ kind: "x", payload: {}, dedupe_key: "defaulted" }).select().single();
+      assert.equal(data.run_after, clock.iso());
+      const claimed = await db().rpc("claim_job", { p_worker: "w1" }).single();
+      assert.equal((claimed.data as any).dedupe_key, "defaulted");
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("every non-null column with a planned default gets it (so cost_cents + 1 is a number, not NaN)", async () => {
+    const clock = fakeClock("2026-10-31T08:00:00.000Z");
+    try {
+      const broker_id = await addBroker();
+      const now = clock.iso();
+      const id = "00000000-0000-4000-8000-0000000000ee";
+      const cases: [string, Record<string, unknown>, Record<string, unknown>][] = [
+        ["sessions", { broker_id, mode: "call", provider: "elevenlabs" }, { readback_confirmed: false, cost_cents: 0 }],
+        ["facts", { session_id: id, rel: "age", label: "Age", turn_id: id, confidence: "agent", source: "tool" }, { status: "active", approx: false }],
+        ["recommendations", { need_id: id }, { status: "draft" }],
+        ["quotes", { session_id: id, broker_id }, { version: 1, status: "draft", flags: [] }],
+        ["deliveries", { quote_id: id, channel: "email", to_address: "thandi@example.test" }, { status: "queued" }],
+        ["hardship_notes", { session_id: id }, { quotes_from_client: [] }],
+        ["product_categories", { id: "life", name: "Life cover", country: "ZA" }, { need_kinds: [] }],
+        ["products", { category_id: "life", provider_name: "Demo Life", name: "Demo Term", verified_on: "2026-10-31" }, { active: true, is_demo: true, exclusions: [], keywords: [] }],
+        ["model_config", { role: "extract", provider: "openrouter", model: "demo/model" }, { fallbacks: [], params: {}, enabled: true }],
+        ["jobs", { kind: "ingest_transcript" }, { payload: {}, status: "queued", attempts: 0, run_after: now }],
+        ["webhook_events", { provider: "meta", event_type: "message", external_id: "wamid.demo2", signature_ok: true, raw: {} }, { received_at: now }],
+        ["audit_log", { action: "approve", entity: "quote" }, { at: now }],
+        ["incidents", { kind: "model", severity: "warn", summary: "demo", fingerprint: "fp_demo" }, { first_at: now, last_at: now, count: 1 }],
+        ["intel_events", { app: "call", trace_id: "t_demo", kind: "track", name: "demo", actor: "system" }, { at: now, seq: 0, v: 1, content_mode: "full" }],
+      ];
+      for (const [table, input, expected] of cases) {
+        const { data, error } = await db().from(table).insert(input).select().single();
+        assert.equal(error, null, table);
+        for (const [column, value] of Object.entries(expected)) assert.deepEqual(data[column], value, `${table}.${column}`);
+      }
+      assert.equal(fake.tables.sessions[0]!.cost_cents + 1, 1);
+      // intel_events' timestamp is `at`; the contract's columns are exact, so there is no created_at.
+      assert.equal("created_at" in fake.tables.intel_events[0]!, false);
+      // A default never overrides what was written, and each row gets its own array.
+      const flagged = await db().from("quotes").insert({ session_id: id, broker_id, status: "held", flags: ["age_unconfirmed"] }).select().single();
+      assert.deepEqual([flagged.data.status, flagged.data.flags], ["held", ["age_unconfirmed"]]);
+      fake.tables.quotes[0]!.flags.push("mutated");
+      assert.deepEqual((await db().from("quotes").insert({ session_id: id, broker_id }).select().single()).data.flags, []);
+    } finally {
+      clock.restore();
+    }
+  });
+});
+
 describe("fake storage", () => {
   test("upload, download, list and remove, through storage.from(bucket) on the fake client", async () => {
     const fake = installFakeDb();
@@ -412,6 +672,32 @@ describe("fake storage", () => {
       assert.equal(removed.data!.length, 1);
       assert.equal(fake.storage.files.has("recordings/s1/chunk-0000.webm"), false);
       assert.equal(fake.storage.files.size, 2);
+    } finally {
+      fake.uninstall();
+    }
+  });
+
+  test("only the recordings and quotes buckets exist; any other answers Bucket not found, as Storage does", async () => {
+    const storage = fakeStorage();
+    const typo = storage.from("recordingz");
+    const results = [
+      await typo.upload("s1/chunk-0000.webm", new Uint8Array([1])),
+      await typo.download("s1/chunk-0000.webm"),
+      await typo.list("s1"),
+      await typo.remove(["s1/chunk-0000.webm"]),
+    ];
+    for (const res of results) {
+      assert.equal(res.data, null);
+      assert.match(res.error!.message, /Bucket not found/);
+    }
+    assert.equal(storage.files.size, 0);
+
+    const fake = installFakeDb();
+    try {
+      const up = await db().storage.from("quote").upload("q1.pdf", new Uint8Array([1]));
+      assert.equal(up.data, null);
+      assert.match(up.error!.message, /Bucket not found/);
+      assert.equal(fake.storage.files.size, 0);
     } finally {
       fake.uninstall();
     }
@@ -528,6 +814,43 @@ describe("fake network", () => {
   test("a fetch nobody scripted throws, naming the URL, and never reaches the network", async () => {
     await assert.rejects(() => fetch("https://example.test/unscripted"), /unexpected request to https:\/\/example\.test\/unscripted/);
     assert.equal(net.calls.length, 1);
+  });
+
+  test("non-string bodies are recorded: bytes, an ArrayBuffer, a Blob, FormData entries, URLSearchParams", async () => {
+    net.onFetch(/upload\.example\.test/, () => ({ ok: true }));
+    const post = (path: string, body: BodyInit) => fetch(`https://upload.example.test/${path}`, { method: "POST", body });
+    await post("bytes", new Uint8Array([1, 2, 3]));
+    await post("buffer", new Uint8Array([4, 5]).buffer);
+    await post("blob", new Blob(['{"x":1}'], { type: "application/json" }));
+    const form = new FormData();
+    form.append("model", "demo/transcriber");
+    form.append("file", new Blob([new Uint8Array([7, 8])], { type: "audio/webm" }), "chunk-0000.webm");
+    await post("form", form);
+    await post("params", new URLSearchParams({ a: "1", b: "two" }));
+
+    const [bytes, buffer, blob, multipart, params] = net.calls;
+    assert.deepEqual([...bytes!.bytes!], [1, 2, 3]);
+    assert.deepEqual([...buffer!.bytes!], [4, 5]);
+    assert.equal(blob!.body, '{"x":1}');
+    assert.deepEqual(blob!.json, { x: 1 });
+    assert.deepEqual(multipart!.form, [
+      { name: "model", value: "demo/transcriber" },
+      { name: "file", filename: "chunk-0000.webm", type: "audio/webm", bytes: new Uint8Array([7, 8]) },
+    ]);
+    assert.equal(params!.body, "a=1&b=two");
+    // A string body is still the string, and its bytes are there too.
+    await post("text", "hello");
+    assert.equal(net.calls[5]!.body, "hello");
+    assert.deepEqual([...net.calls[5]!.bytes!], [...new TextEncoder().encode("hello")]);
+  });
+
+  test("a /g or /y pattern matches on every call (RegExp.test is stateful with those flags)", async () => {
+    net.onFetch(/api\.resend\.com/g, () => ({ id: "email_demo" }));
+    net.onModel(/You extract facts/y, () => "ok");
+    for (let i = 0; i < 2; i++) {
+      assert.equal((await fetch("https://api.resend.com/emails", { method: "POST", body: "{}" })).status, 200);
+      assert.equal((await (await chat(`MARKER ${i}`)).json()).choices[0].message.content, "ok");
+    }
   });
 
   test("restore() puts the real fetch back; so does uninstall()", () => {
