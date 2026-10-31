@@ -22,12 +22,17 @@
 //   - The row is written BEFORE the send, and it is the claim on the send: its
 //     id is derived from the email it follows (slotId), so two passes at once —
 //     two drains finishing together — compute the same id, and the primary key
-//     lets exactly one of them write it (one conditional write). The send then
-//     carries that id as Resend's idempotency key, and the row is marked sent
-//     or failed. A row that could not be marked stays "sending" and counts as
-//     sent: an email that went but whose record did not finish is never sent
-//     again, at the price that one claimed but never sent waits for its
-//     problem to grow.
+//     lets exactly one of them write it (one conditional write). The row is
+//     then marked sent or failed. A row that could not be marked stays
+//     "sending" and counts as sent: an email that went but whose record did
+//     not finish is never sent again, at the price that one claimed but never
+//     sent waits for its problem to grow.
+//   - The send's idempotency key is the alert's own (alertKey: its kind and
+//     the fingerprint:count pairs it reports), not the record's: a send that
+//     timed out but was delivered is marked failed, and the next pass sends
+//     the same alert again under the same key, which Resend answers without
+//     sending twice (it keeps a key for 24 hours). A slot id never repeats, so
+//     as the key it stopped no duplicate (re-review).
 //
 // The rules, as Charlie learned them:
 //   - At most one immediate email every 5 minutes, listing everything new
@@ -154,6 +159,16 @@ export function slotId(kind: EmailKind, prev: string | null): string {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
+/**
+ * Resend's idempotency key for an alert: what it reports, so the same alert
+ * sent twice (a pass that timed out on a send that went, then the next pass)
+ * is one email, and anything new (a count grew, another problem) is a new one.
+ */
+function alertKey(kind: EmailKind, due: Due[]): string {
+  const pairs = due.map(({ row }) => `${row.fingerprint}:${row.count}`).sort();
+  return `alert:${kind}:${createHash("sha256").update(pairs.join("\n")).digest("hex").slice(0, 40)}`;
+}
+
 /** When each problem was last emailed, and at what count (newest email first, so the first seen wins). */
 function lastSentOf(went: SentEmail[]): Map<string, { at: number; count: number }> {
   const lastSent = new Map<string, { at: number; count: number }>();
@@ -206,7 +221,7 @@ async function sendClaimed(kind: EmailKind, tip: SentEmail | null, now: Date, ms
   if (claimError && (claimError as { code?: string }).code === "23505") return 0;
   if (claimError) throw new Error(`alert email could not be claimed: ${errorText(claimError)}`);
 
-  const res = await sendEmail({ ...msg, idempotencyKey: `alert:${id}` });
+  const res = await sendEmail({ ...msg, idempotencyKey: alertKey(kind, due) });
   const mark = async (after: Record<string, unknown>): Promise<void> => {
     const { error } = await db().from("audit_log").update({ after }).eq("id", id);
     // The row stays "sending", which counts as sent: never re-sent, and said here.

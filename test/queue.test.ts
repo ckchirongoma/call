@@ -21,9 +21,9 @@ import { performance } from "node:perf_hooks";
 import { fakeClock, installFakeDb, installFakeNet, jsonResponse, type FakeClock, type FakeDb, type FakeNet, type QueryLog } from "./_fakes.ts";
 import { TEST_ENV, setEnv } from "./_env.ts";
 import { db } from "../api/_lib/db.ts";
-import { DeadlineError, JobHoldError, type JobCtx } from "../api/_lib/jobctx.ts";
+import { DeadlineError, JobHoldError, MODEL_REFUSAL_MS, type JobCtx } from "../api/_lib/jobctx.ts";
 import { __clearModelCache, askJSON } from "../api/_lib/models.ts";
-import { FLUSH_TIMEOUT_MS, flushTracking } from "../api/_lib/track.ts";
+import { FLUSH_TIMEOUT_MS, flushTracking, onTrack } from "../api/_lib/track.ts";
 import { ALERT_PASS_MAX_MS } from "../api/_lib/alerts.ts";
 import { sendEmailTo } from "../api/_lib/email.ts";
 import * as queue from "../api/_lib/queue.ts";
@@ -102,7 +102,12 @@ const worker = (path: string, secret: string | null, method: "GET" | "POST" = "P
     new Request(`https://call.test${path}`, { method, headers: secret === null ? {} : { authorization: `Bearer ${secret}` } }),
   );
 
+/** Every track() event, by name and props (most are not incidents): cleared before each test. */
+const events: { name: string; props: Row }[] = [];
+onTrack((name, opts) => void events.push({ name, props: { ...(opts.props ?? {}) } }));
+
 beforeEach(() => {
+  events.length = 0;
   clock = fakeClock("2026-10-31T08:00:00.000Z");
   fake = installFakeDb({ sessions: SESSIONS.map(session) });
   net = installFakeNet();
@@ -677,6 +682,47 @@ describe("queue: claiming and fencing", () => {
     }
   });
 
+  test("a heartbeat whose job was deleted with its session, or cancelled, reports it so, not as a lock taken by another worker", async () => {
+    const undoBeat = queue.__setHeartbeatMs(5);
+    const isBeat = (q: QueryLog) => q.table === "jobs" && q.op === "update" && "locked_at" in (q.rows?.[0] ?? {}) && !("status" in (q.rows?.[0] ?? {}));
+    let held = gate();
+    let started = gate();
+    queue.registerHandler("write_quote", async () => {
+      started.open();
+      await held.wait;
+    });
+    try {
+      // "Forget me" mid-step: the row goes with its session.
+      await queue.enqueue("write_quote", S1, {});
+      let attempt = queue.drain({ maxJobs: 1 });
+      await started.wait;
+      await db().from("sessions").delete().eq("id", S1);
+      let beats = fake.log.filter(isBeat).length;
+      await until(() => fake.log.filter(isBeat).length >= beats + 3 && events.some((e) => e.name === "job_orphaned"), "beats on a deleted job");
+      held.open();
+      assert.equal((await attempt).fenced, 1);
+
+      // An operator (or forgetClient) cancelled it mid-step.
+      held = gate();
+      started = gate();
+      const id = await queue.enqueue("write_quote", S2, {});
+      attempt = queue.drain({ maxJobs: 1 });
+      await started.wait;
+      jobRow(id).status = "cancelled";
+      beats = fake.log.filter(isBeat).length;
+      await until(() => fake.log.filter(isBeat).length >= beats + 3 && events.filter((e) => e.name === "job_orphaned").length === 2, "beats on a cancelled job");
+      held.open();
+      assert.equal((await attempt).fenced, 1);
+
+      await flushTracking();
+      assert.equal(incidents("job_heartbeat_failed").length, 0, "no worker took either lock");
+      assert.deepEqual(events.filter((e) => e.name === "job_orphaned").map((e) => e.props.reason), ["deleted_with_session", "cancelled"]);
+    } finally {
+      held.open();
+      undoBeat();
+    }
+  });
+
   test("an unreadable session check counts as busy (the job is held, never run beside its session) and leaves a trace", async () => {
     fake.failTable("jobs", { code: "57014", message: "canceling statement due to statement timeout" });
     assert.equal(await queue.otherJobRunningFor(S1, 1), true);
@@ -804,31 +850,80 @@ describe("queue: retries", () => {
     assert.match(incident!.summary, new RegExp(`session ${S1.slice(0, 8)}`), "the session, by its first 8 characters");
   });
 
-  test("[C-0493][C-1505] a DeadlineError inside a model call requeues the job for a fresh worker without counting a failure; a second one in a row counts", async () => {
+  test("[C-0493][C-1505] a DeadlineError in an attempt that started late requeues the job without counting a failure, however often; in an attempt that had a whole worker it counts (the job does not fit)", async () => {
     fake.tables.model_config.push(extractRow());
+    queue.registerHandler("ingest_transcript", async () => {
+      clock.advance(150_000); // the first job of the drain takes most of it
+    });
+    let beforeModel = 80_000;
     queue.registerHandler("extract_facts", async () => {
+      clock.advance(beforeModel); // the step's own work before its model call
       await askJSON("extract", "Extract the facts from the transcript below.", { label: "extract_facts" });
     });
+    await queue.enqueue("ingest_transcript", S2, {});
     const id = await queue.enqueue("extract_facts", S1, {});
 
-    // A drain whose hard stop is already behind it: the model layer refuses to start the call.
-    const first = await queue.drain({ maxJobs: 1, hardStopMs: 1 });
-    assert.deepEqual({ failed: first.failed, held: first.held }, { failed: 0, held: 1 });
+    // Claimed at 150 s, inside the claim cutoff; its model call comes at 230 s, past the refusal point.
+    const first = await queue.drain({ maxJobs: 2, parallel: 1 });
+    assert.deepEqual({ claimed: first.claimed, failed: first.failed, held: first.held }, { claimed: 2, failed: 0, held: 1 });
     assert.equal(net.modelCalls.length, 0, "no model request was started without time to finish it");
     let row = jobRow(id);
     assert.equal(row.status, "queued");
     assert.equal(row.attempts, 0, "the attempt is given back");
     assert.ok(Date.parse(row.run_after) <= clock.now(), "runnable at once, by the next worker");
     assert.match(String(row.last_error), /out of time/);
+
+    // Late again, in the next drain: still lack of budget, still not an attempt.
+    await queue.enqueue("ingest_transcript", S3, {}, { runAfter: new Date(clock.now() - 1_000) });
+    const again = await queue.drain({ maxJobs: 2, parallel: 1 });
+    assert.deepEqual({ failed: again.failed, held: again.held }, { failed: 0, held: 1 });
+    assert.equal(jobRow(id).attempts, 0, "a refusal for lack of budget never counts");
     await flushTracking();
     assert.equal(incidents("job_retry").length, 0, "not a failure");
 
-    // The fresh worker runs out of time too: now it counts, or a job that can never fit would loop forever.
-    const second = await queue.drain({ maxJobs: 1, hardStopMs: 1 });
-    assert.equal(second.failed, 1);
+    // A fresh worker, and the step alone runs past the refusal point: it does not fit, so it counts.
+    beforeModel = 230_000;
+    const fresh = await queue.drain({ maxJobs: 1 });
+    assert.equal(fresh.failed, 1);
     row = jobRow(id);
     assert.equal(row.attempts, 1);
     assert.equal(secondsAhead(row.run_after), 10);
+  });
+
+  test("[C-0493] a worker that cannot hand on stops claiming before model calls are refused: a job it reaches at 230 s stays queued with its attempt unspent, and one refused late is held and not claimed again", async () => {
+    process.env.TRACKING_OFF = "0";
+    net.onFetch("call.test/api/worker", () => jsonResponse({ accepted: true }, 202));
+    fake.tables.model_config.push(extractRow());
+    const firstJobTakes: Record<string, number> = { [S1]: 230_000, [S3]: 200_000 };
+    queue.registerHandler("ingest_transcript", async (job) => {
+      clock.advance(firstJobTakes[String(job.session_id)] ?? 0);
+    });
+    queue.registerHandler("extract_facts", async (job) => {
+      clock.advance(Number((job.payload as Row).before_model_ms ?? 0));
+      await askJSON("extract", "Extract the facts from the transcript below.", { label: "extract_facts" });
+    });
+    const deepest = () => queue.withHop(queue.MAX_WORKER_HOP, () => queue.drain({ parallel: 1, label: "handon" }));
+
+    // Reached at 230 s, past the cutoff: not claimed at all.
+    await queue.enqueue("ingest_transcript", S1, {});
+    const reached = await queue.enqueue("extract_facts", S2, {});
+    jobRow(reached).attempts = queue.MAX_ATTEMPTS - 1; // its last attempt, had it been spent
+    const r1 = await deepest();
+    assert.equal(r1.claimed, 1, "only the first job");
+    assert.deepEqual({ status: jobRow(reached).status, attempts: jobRow(reached).attempts }, { status: "queued", attempts: queue.MAX_ATTEMPTS - 1 });
+    jobRow(reached).status = "cancelled"; // out of the way of the next scenario
+
+    // Claimed at 200 s, inside the cutoff, and refused at 230 s: held, and this drain does not claim it again.
+    await queue.enqueue("ingest_transcript", S3, {}, { runAfter: new Date(clock.now() - 60_000) });
+    const refused = await queue.enqueue("extract_facts", S4, { before_model_ms: 30_000 }, { runAfter: new Date(clock.now() - 30_000) });
+    jobRow(refused).attempts = queue.MAX_ATTEMPTS - 1;
+    const r2 = await deepest();
+    assert.deepEqual({ claimed: r2.claimed, failed: r2.failed, held: r2.held }, { claimed: 2, failed: 0, held: 1 });
+    assert.deepEqual({ status: jobRow(refused).status, attempts: jobRow(refused).attempts }, { status: "queued", attempts: queue.MAX_ATTEMPTS - 1 });
+
+    assert.equal(net.modelCalls.length, 0);
+    await flushTracking();
+    assert.equal(incidents("job_failed").length, 0, "no page for a job that never made a model request");
   });
 
   test("a JobHoldError puts the job back after its delay without spending an attempt", async () => {
@@ -1090,7 +1185,7 @@ describe("worker: waiting, overdue work and the time it has", () => {
   test("a queued job more than 10 minutes past its time raises job_overdue on the next worker run, and overdueJobs() says so for health", async () => {
     queue.registerHandler("ingest_transcript", async () => {});
     await queue.enqueue("ingest_transcript", S1, {}, { runAfter: new Date(clock.now() - 9 * 60_000) });
-    assert.deepEqual(await queue.overdueJobs(), { count: 0, oldest: null }, "nine minutes late is not yet overdue");
+    assert.deepEqual(await queue.overdueJobs(), { count: 0, oldest: null, behind: 0 }, "nine minutes late is not yet overdue");
     clock.advance(2 * 60_000);
     const overdue = await queue.overdueJobs();
     assert.equal(overdue.count, 1);
@@ -1105,7 +1200,32 @@ describe("worker: waiting, overdue work and the time it has", () => {
     assert.match(incident.summary, /ingest transcript/);
     assert.match(incident.summary, /11 min/);
     assert.equal(jobsOf("ingest_transcript")[0]!.status, "done", "and the run that noticed it did it");
-    assert.deepEqual(await queue.overdueJobs(), { count: 0, oldest: null });
+    assert.deepEqual(await queue.overdueJobs(), { count: 0, oldest: null, behind: 0 });
+  });
+
+  test("one claim cutoff, below the model-refusal point by at least a step's lead: whatever a drain claims can start its first model call", () => {
+    assert.ok(queue.CLAIM_CUTOFF_MS - MODEL_REFUSAL_MS >= queue.STEP_LEAD_MS, "a claimed step has its lead before calls are refused");
+    assert.ok(queue.STEP_LEAD_MS > 0);
+    // The drain that can hand on stops sooner still (150 s); the one that cannot stops at the cutoff.
+    const hardStop = queue.WORKER_BUDGET_MS + queue.HARD_STOP_MARGIN_MS;
+    assert.ok(hardStop - queue.CLAIM_CUTOFF_MS < hardStop - MODEL_REFUSAL_MS);
+  });
+
+  test("job_overdue counts only work claim_job could hand out: a step waiting behind its session's deferred send is not overdue", async () => {
+    await queue.enqueue("send_quote", S1, {}, { runAfter: new Date("2026-11-01T00:00:00.000Z") }); // C-1067: tomorrow
+    await queue.enqueue("notify_broker", S1, {}, { runAfter: new Date(clock.now() - 30 * 60_000) }); // behind it, on purpose
+    const waiting = await queue.overdueJobs();
+    assert.deepEqual({ count: waiting.count, oldest: waiting.oldest, behind: waiting.behind }, { count: 0, oldest: null, behind: 1 });
+    await queue.noteOverdueJobs();
+    await flushTracking();
+    assert.equal(incidents("job_overdue").length, 0, "nothing is stranded: it waits for its session");
+
+    await queue.enqueue("extract_facts", S2, {}, { runAfter: new Date(clock.now() - 20 * 60_000) });
+    const stranded = await queue.overdueJobs();
+    assert.deepEqual({ count: stranded.count, kind: stranded.oldest?.kind, behind: stranded.behind }, { count: 1, kind: "extract_facts", behind: 1 });
+    await queue.noteOverdueJobs();
+    await flushTracking();
+    assert.equal(incidents("job_overdue").length, 1);
   });
 
   test("the tail after the hard stop fits inside Vercel's 300 s kill: the flush, a hand-on of two 5 s self-calls, and the alert pass", () => {

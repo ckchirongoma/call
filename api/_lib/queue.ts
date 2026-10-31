@@ -37,10 +37,13 @@
 //     carries no session_id at all (enqueue).
 //   - Three attempts, 10 s then 60 s apart, then `failed` and an incident
 //     (job_failed), which alerts.ts emails at once. A hold (JobHoldError), a
-//     busy session and the first out-of-time requeue (DeadlineError) do not
-//     spend an attempt. A worker run waits in-process for a retry that falls
-//     due inside its budget (waitForDue), and a queued job left more than 10
-//     minutes past its time is an incident on the next run (job_overdue).
+//     busy session and an out-of-time refusal (DeadlineError) in an attempt
+//     that started late do not spend an attempt, and no drain claims past the
+//     point where model calls are refused (CLAIM_CUTOFF_MS). A worker run
+//     waits in-process for a retry that falls due inside its budget
+//     (waitForDue), and a queued job left more than 10 minutes past its time,
+//     with nothing of its session ahead of it, is an incident on the next run
+//     (job_overdue).
 //   - Nothing half-written. A step's next step is queued only once the step has
 //     returned (enqueueNext). A forgotten session's jobs are deleted with it
 //     (jobs.session_id ON DELETE CASCADE): a queued one is gone, a running one
@@ -60,7 +63,7 @@ import { randomUUID } from "node:crypto";
 import { db } from "./db.js";
 import { env } from "./env.js";
 import { capture } from "./intel.js";
-import { DeadlineError, JobFencedError, JobHoldError, jobCtx, type JobCtx } from "./jobctx.js";
+import { DeadlineError, JobFencedError, JobHoldError, MIN_CALL_MS, MODEL_REFUSAL_MS, jobCtx, type JobCtx } from "./jobctx.js";
 import type { Job } from "./types.js";
 import { cutSafe, errorText, flushTracking, since, track, trackFailure, trackingOff, withTrackContext, type TrackOptions } from "./track.js";
 
@@ -179,6 +182,32 @@ export const WORKER_BUDGET_MS = 240_000;
 export const HARD_STOP_MARGIN_MS = 10_000;
 /** The woken worker answers 202 before it does any work, so 5 s is ample, and two of them fit the tail. */
 export const SELF_CALL_TIMEOUT_MS = 5_000;
+
+/**
+ * What a claimed step may spend before its first model call (reading its
+ * inputs, a first write): one more model call's worth.
+ */
+export const STEP_LEAD_MS = MIN_CALL_MS;
+
+/**
+ * A drain stops claiming this long before its hard stop: the refusal point
+ * (jobctx.ts MODEL_REFUSAL_MS, where model calls stop starting) plus a step's
+ * lead, so whatever a drain claims can start its first model call. Task 0.4's
+ * re-review: a worker that could not hand on claimed until 240 s while calls
+ * were refused from 225 s, so a job claimed in the gap was refused, put back,
+ * claimed again by the same drain, refused again, and that second refusal
+ * counted: `failed` after zero model calls, and an immediate email.
+ */
+export const CLAIM_CUTOFF_MS = MODEL_REFUSAL_MS + STEP_LEAD_MS;
+
+/**
+ * An attempt that starts this soon after its drain began had a whole worker's
+ * time. If its model call is still refused, the job does not fit in a worker,
+ * and the refusal counts as an attempt (or it would be put back for ever). An
+ * attempt that started later was refused for lack of budget, which never
+ * counts (C-0493).
+ */
+export const FRESH_ATTEMPT_MS = 60_000;
 
 /** How far ahead a queued job still counts as "left for us to do". */
 const HAND_ON_WITHIN_MS = 60_000;
@@ -411,8 +440,8 @@ export async function stillOwnJob(id: number, worker: string): Promise<boolean> 
  * Put a job back without counting the attempt.
  *
  * Used when the job was not really tried: its session was busy, it is waiting
- * on other work (JobHoldError), or it ran out of time the first time
- * (DeadlineError). Counting those as failed attempts would let a busy session
+ * on other work (JobHoldError), or it ran out of time in an attempt that
+ * started late (DeadlineError). Counting those as failed attempts would let a busy session
  * exhaust MAX_ATTEMPTS on a job nothing was ever wrong with. Returns whether
  * it was this attempt's to put back (see scheduleRetry).
  */
@@ -484,10 +513,15 @@ export async function queuedWorkDue(withinMs: number, now = Date.now()): Promise
 }
 
 export interface OverdueReport {
-  /** Queued jobs more than OVERDUE_MS past their run_after. */
+  /** Queued jobs more than OVERDUE_MS past their run_after that claim_job could hand out now. */
   count: number;
   oldest: { id: number; kind: string; minutes: number } | null;
+  /** As late, but waiting on purpose behind an earlier queued or running job of their session (not counted). */
+  behind: number;
 }
+
+/** Overdue rows read at most: enough to count a backlog, bounded for a health check. */
+const OVERDUE_ROWS = 200;
 
 /**
  * Queued work nothing has woken for: a job more than 10 minutes past its
@@ -497,18 +531,36 @@ export interface OverdueReport {
  * (Task 11.2); the worker raises it at the start of each run (noteOverdueJobs).
  */
 export async function overdueJobs(now = Date.now()): Promise<OverdueReport> {
-  const { data, error, count } = await db()
+  const { data, error } = await db()
     .from("jobs")
-    .select("id, kind, run_after", { count: "exact" })
+    .select("id, kind, session_id, run_after")
     .eq("status", "queued")
     .lt("run_after", new Date(now - OVERDUE_MS).toISOString())
     .order("run_after", { ascending: true })
-    .limit(1);
+    .limit(OVERDUE_ROWS);
   if (error) throw new Error(`overdueJobs failed: ${errorText(error)}`);
-  const row = ((data as { id: number; kind: string; run_after: string }[] | null) ?? [])[0];
+  const late = (data as { id: number; kind: string; session_id: string | null; run_after: string }[] | null) ?? [];
+  // claim_job's own session rule: a job behind an earlier queued or running
+  // job of its session is waiting on purpose (a send deferred to midnight,
+  // C-1067, holds the session's later steps), not stranded, and nothing this
+  // run could do would move it. forget_client never waits behind its session.
+  const sessions = [...new Set(late.filter((j) => j.session_id && !RUNS_WITHOUT_SESSION.has(j.kind)).map((j) => j.session_id as string))];
+  const firstOpen = new Map<string, number>();
+  if (sessions.length) {
+    const open = await db().from("jobs").select("id, session_id").in("session_id", sessions).in("status", ["queued", "running"]);
+    if (open.error) throw new Error(`overdueJobs failed: ${errorText(open.error)}`);
+    for (const r of (open.data as { id: number; session_id: string }[] | null) ?? []) {
+      firstOpen.set(r.session_id, Math.min(firstOpen.get(r.session_id) ?? Infinity, r.id));
+    }
+  }
+  const behindItsSession = (j: (typeof late)[number]): boolean =>
+    j.session_id !== null && !RUNS_WITHOUT_SESSION.has(j.kind) && (firstOpen.get(j.session_id) ?? Infinity) < j.id;
+  const stranded = late.filter((j) => !behindItsSession(j));
+  const row = stranded[0];
   return {
-    count: count ?? 0,
+    count: stranded.length,
     oldest: row ? { id: row.id, kind: row.kind, minutes: Math.floor((now - Date.parse(row.run_after)) / 60_000) } : null,
+    behind: late.length - stranded.length,
   };
 }
 
@@ -563,6 +615,14 @@ async function sessionGone(job: JobRow): Promise<boolean> {
   // A read that failed is not a deleted session: the step runs, and fails on its own if the database is down.
   if (error) return false;
   return !data;
+}
+
+/** Why a heartbeat touched no row: the job is gone with its session, cancelled, or another worker holds it. */
+async function whyLockLost(id: number): Promise<"deleted_with_session" | "cancelled" | "lock_lost"> {
+  const { data, error } = await db().from("jobs").select("status").eq("id", id).maybeSingle();
+  if (error) return "lock_lost";
+  if (!data) return "deleted_with_session";
+  return (data as { status: string }).status === "cancelled" ? "cancelled" : "lock_lost";
 }
 
 /** The job's row is gone: deleted with its session (jobs.session_id ON DELETE CASCADE). */
@@ -695,7 +755,7 @@ export interface DrainReport {
   done: number;
   /** Attempts that failed: retried with backoff, or failed for good. */
   failed: number;
-  /** Put back without spending an attempt: a busy session, a JobHoldError, a first out-of-time. */
+  /** Put back without spending an attempt: a busy session, a JobHoldError, an out-of-time refusal in a late attempt. */
   held: number;
   /** Stopped because another worker had reclaimed the job, or its row went with its session (jobctx.ts). */
   fenced: number;
@@ -732,9 +792,13 @@ export async function drain(opts: DrainOptions = {}): Promise<DrainReport> {
   // and a killed drain never hands on. What is left goes to a fresh worker
   // with a full budget instead. The deepest worker of a chain (MAX_WORKER_HOP)
   // has no fresh worker to leave it to, so it uses its whole budget.
+  // Either way, never past the claim cutoff: a job claimed there could only
+  // have its model calls refused (CLAIM_CUTOFF_MS).
   const canHandOn = !opts.noHandOn && selfCallsAllowed() && mayWakeWorker();
-  const claimUntil = canHandOn ? Math.max(budgetMs * 0.6, budgetMs - 90_000) : budgetMs;
-  const hardStopAt = started + (opts.hardStopMs ?? budgetMs + HARD_STOP_MARGIN_MS);
+  const hardStopMs = opts.hardStopMs ?? budgetMs + HARD_STOP_MARGIN_MS;
+  const claimUntil = Math.min(canHandOn ? Math.max(budgetMs * 0.6, budgetMs - 90_000) : budgetMs, hardStopMs - CLAIM_CUTOFF_MS);
+  const hardStopAt = started + hardStopMs;
+  const freshUntil = started + FRESH_ATTEMPT_MS;
   const mayClaim = (): boolean => Date.now() - started < claimUntil;
 
   // Lanes share the claim count and a "something finished" signal: a lane
@@ -818,7 +882,7 @@ export async function drain(opts: DrainOptions = {}): Promise<DrainReport> {
       report.claimed++;
       busy++;
       try {
-        await runAttempt(job, worker, hardStopAt, report);
+        await runAttempt(job, worker, hardStopAt, freshUntil, report);
       } catch (err) {
         // Only the queue's own bookkeeping can land here (a retry that could
         // not be written): the job keeps its lock, and claim_job hands it out
@@ -869,7 +933,7 @@ export async function drain(opts: DrainOptions = {}): Promise<DrainReport> {
 }
 
 /** One attempt at one claimed job, settled whatever happens: done, retried, held, skipped, fenced or failed. */
-async function runAttempt(job: JobRow, worker: string, hardStopAt: number, report: DrainReport): Promise<void> {
+async function runAttempt(job: JobRow, worker: string, hardStopAt: number, freshUntil: number, report: DrainReport): Promise<void> {
   const facts = { kind: job.kind, attempt: job.attempts, max_attempts: MAX_ATTEMPTS };
   const sessionRef = job.session_id ? job.session_id.slice(0, 8) : null;
   const what = `The ${job.kind.replace(/_/g, " ")} job`;
@@ -954,9 +1018,16 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
     // leave none at all.
     let live = true;
     let beatTraced = false;
-    const traceBeat = (reason: "error" | "lock_lost", err?: unknown): void => {
+    const traceBeat = (reason: "error" | "lock_lost" | "deleted_with_session" | "cancelled", err?: unknown): void => {
       if (!live || beatTraced) return;
       beatTraced = true;
+      // No worker took it: "forget me" deleted the job with its session, or it
+      // was cancelled (forgetClient, an operator). Expected, so an event, not
+      // an incident; the attempt is fenced at its next write.
+      if (reason === "deleted_with_session" || reason === "cancelled") {
+        track("job_orphaned", { category: "behaviour", props: { ...facts, reason } });
+        return;
+      }
       trackFailure("job_heartbeat_failed", err ?? "the lock was no longer this attempt's", {
         severity: "warn",
         alert: "digest",
@@ -972,7 +1043,7 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
       () =>
         void touchJob(job.id, worker).then(
           (touched) => {
-            if (!touched) traceBeat("lock_lost");
+            if (!touched) void whyLockLost(job.id).then((reason) => traceBeat(reason));
           },
           (err) => traceBeat("error", err),
         ),
@@ -996,7 +1067,7 @@ async function runAttempt(job: JobRow, worker: string, hardStopAt: number, repor
       } else fenced();
     } catch (err) {
       live = false;
-      await settleFailure(job, worker, err, report, { facts, sessionRef, what, startedAt });
+      await settleFailure(job, worker, err, report, { facts, sessionRef, what, startedAt, fresh: startedAt <= freshUntil });
     } finally {
       live = false;
       clearInterval(beat);
@@ -1017,7 +1088,7 @@ async function settleFailure(
   worker: string,
   err: unknown,
   report: DrainReport,
-  about: { facts: Record<string, unknown>; sessionRef: string | null; what: string; startedAt: number },
+  about: { facts: Record<string, unknown>; sessionRef: string | null; what: string; startedAt: number; fresh: boolean },
 ): Promise<void> {
   const fenced = (): void => {
     report.fenced++;
@@ -1044,13 +1115,16 @@ async function settleFailure(
     } else fenced();
     return;
   }
-  // Out of time (jobctx.ts DeadlineError, C-0493): not a failure, the first
-  // time — the attempt started too late in its worker, and goes straight back
-  // for a fresh one, attempt unspent. Twice in a row is not lateness: the job
-  // does not fit in a worker at all, and from then on it counts, or it would
-  // be requeued for ever.
+  // Out of time (jobctx.ts DeadlineError, C-0493). In an attempt that started
+  // late in its worker it is lack of budget, never a failure, however often:
+  // the job goes straight back for a fresh worker, attempt unspent, and this
+  // drain cannot claim it again (it is past CLAIM_CUTOFF_MS by now). In an
+  // attempt that had a whole worker (FRESH_ATTEMPT_MS) it is not lateness: the
+  // job does not fit in a worker at all, and it counts, or it would be
+  // requeued for ever. (Before the re-review it was "the second refusal in a
+  // row counts", and both refusals could happen in the same late worker.)
   const message = errorText(err);
-  if (err instanceof DeadlineError && !/out of time/.test(job.last_error ?? "")) {
+  if (err instanceof DeadlineError && !about.fresh) {
     if (await holdJob(job.id, job.attempts, err.message, 0, worker)) {
       report.held++;
       captureJob("held", job, { ms: since(about.startedAt), meta: { reason: "out_of_time", delay_ms: 0 } });

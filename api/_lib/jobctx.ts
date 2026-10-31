@@ -41,6 +41,24 @@ export interface JobCtx {
 
 export const jobCtx = new AsyncLocalStorage<JobCtx>();
 
+/**
+ * The least time worth starting a model call with inside a job attempt. The
+ * slowest calls that succeed take 60-75s; a call started with less than this
+ * left is more likely to be cut off by the platform than to finish.
+ */
+export const MIN_CALL_MS = 20_000;
+
+/** A model request's timeout leaves this much for the job to record the result. */
+export const WRAP_UP_MS = 5_000;
+
+/**
+ * The refusal point: with less than this left before the attempt's deadline,
+ * models.ts refuses to start a model call (DeadlineError). Here, beside the
+ * deadline, because the queue must stop claiming before it (queue.ts
+ * CLAIM_CUTOFF_MS): a job claimed past it can only be refused.
+ */
+export const MODEL_REFUSAL_MS = MIN_CALL_MS + WRAP_UP_MS;
+
 /** Thrown at a send when this attempt no longer owns its job. Never retried: the job is someone else's now. */
 export class JobFencedError extends Error {
   constructor(id: number) {

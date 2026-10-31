@@ -254,7 +254,7 @@ describe("alerts: the immediate email", () => {
     await runAlerts();
     fake.failTable("audit_log", null);
     assert.equal(emails.length, 1);
-    assert.match(String(emails[0]!.headers["idempotency-key"]), /^alert:[0-9a-f-]{36}$/);
+    assert.match(String(emails[0]!.headers["idempotency-key"]), /^alert:immediate:[0-9a-f]{40}$/);
     assert.equal(alertRows().length, 1, "recorded before the send");
 
     clock.advance(6 * MIN);
@@ -262,6 +262,32 @@ describe("alerts: the immediate email", () => {
     clock.advance(40 * MIN);
     await runAlerts();
     assert.equal(emails.length, 1, "not sent again, however many passes follow");
+  });
+
+  test("an alert email's idempotency key is the alert's own: a send that timed out but went is sent again under the same key, so Resend delivers it once; a new problem is a new key", async () => {
+    process.env.TRACKING_OFF = "0";
+    const delivered = new Map<string, string>();
+    net.onFetch("api.resend.com/emails", (call) => {
+      emails.push(call);
+      const key = String(call.headers["idempotency-key"]);
+      if (!delivered.has(key)) delivered.set(key, `email-${delivered.size + 1}`);
+      // The first email goes, but its answer never comes back.
+      if (emails.length === 1) throw new TypeError("fetch failed: socket hang up");
+      return jsonResponse({ id: delivered.get(key) });
+    });
+    await failJob("write_quote", S1);
+    assert.equal((await runAlerts()).immediate, 0, "no answer: not known to have gone");
+    clock.advance(1 * MIN);
+    assert.equal((await runAlerts()).immediate, 1);
+    assert.equal(emails.length, 2, "sent again by the next pass");
+    assert.equal(emails[1]!.headers["idempotency-key"], emails[0]!.headers["idempotency-key"], "under the same key");
+    assert.equal(delivered.size, 1, "so Resend delivered one email");
+
+    clock.advance(6 * MIN);
+    await failJob("check_quote", S2);
+    assert.equal((await runAlerts()).immediate, 1);
+    assert.notEqual(emails[2]!.headers["idempotency-key"], emails[0]!.headers["idempotency-key"], "a new alert, a new key");
+    assert.equal(delivered.size, 2);
   });
 
   test("an incident last emailed days ago reports what is new since that email, not its lifetime count", async () => {

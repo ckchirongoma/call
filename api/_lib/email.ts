@@ -143,7 +143,12 @@ export async function sendEmailTo(msg: EmailToMessage): Promise<EmailResult> {
   }
 }
 
-/** The alert email: to every valid address in ALERT_EMAIL_TO. alerts.ts passes the key of the record it wrote first, so a retried send cannot double it. */
+/**
+ * The alert email: to every valid address in ALERT_EMAIL_TO. alerts.ts passes
+ * a key derived from what the alert reports (alertKey), so when a send times
+ * out but went and the next pass sends the same alert again, Resend answers
+ * the repeat without delivering it twice (within its 24-hour key window).
+ */
 export async function sendEmail(msg: EmailMessage & { idempotencyKey?: string }): Promise<EmailResult> {
   if (!alertsConfigured()) return { ok: false, skipped: true, error: "email not configured" };
   return sendEmailTo({ ...msg, to: alertRecipients(), fromName: "Call alerts" });

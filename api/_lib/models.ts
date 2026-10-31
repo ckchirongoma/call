@@ -51,7 +51,7 @@
 import { db } from "./db.js";
 import { env } from "./env.js";
 import { capture } from "./intel.js";
-import { DeadlineError, jobCtx, jobMsLeft, onLastAttempt } from "./jobctx.js";
+import { DeadlineError, MIN_CALL_MS, MODEL_REFUSAL_MS, WRAP_UP_MS, jobCtx, jobMsLeft, onLastAttempt } from "./jobctx.js";
 import { currentTrackContext, errorText, holdForFlush, track, trackFailure } from "./track.js";
 import type { ModelConfig as ModelConfigRow, ModelRole } from "./types.js";
 
@@ -122,14 +122,12 @@ export const CONFIG_CACHE_MS = 60_000;
 const STANDING_INCIDENT_EVERY_MS = 24 * 60 * 60_000;
 
 /**
- * The least time worth starting a model call with inside a job attempt. The
- * slowest calls that succeed take 60-75s; a call started with less than this
- * left is more likely to be cut off by the platform than to finish.
+ * MIN_CALL_MS (the least time worth starting a model call with inside a job
+ * attempt) and WRAP_UP_MS (what a request's timeout leaves the job to record
+ * the result) live in jobctx.ts, with MODEL_REFUSAL_MS, their sum: the queue
+ * stops claiming before that point (queue.ts CLAIM_CUTOFF_MS).
  */
-export const MIN_CALL_MS = 20_000;
-
-/** The per-request timeout leaves this much for the job to record the result. */
-const WRAP_UP_MS = 5_000;
+export { MIN_CALL_MS };
 
 /** The longest one request may run, headers and body, when no deadline is nearer. */
 const REQUEST_TIMEOUT_MS = 90_000;
@@ -360,7 +358,7 @@ function callWindow(label: string, askDeadlineAt: number | null): number {
   const askLeft = askDeadlineAt === null ? null : askDeadlineAt - Date.now();
   const left = jobLeft === null ? askLeft : askLeft === null ? jobLeft : Math.min(jobLeft, askLeft);
   if (left === null) return REQUEST_TIMEOUT_MS;
-  if (left - WRAP_UP_MS < MIN_CALL_MS) throw new DeadlineError(`the model call [${label}]`, left);
+  if (left < MODEL_REFUSAL_MS) throw new DeadlineError(`the model call [${label}]`, left);
   return Math.min(REQUEST_TIMEOUT_MS, left - WRAP_UP_MS);
 }
 
